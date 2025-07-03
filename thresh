@@ -1,0 +1,131 @@
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize_scalar # To find optimal threshold
+
+# --- 1. Simulate Data (Example) ---
+np.random.seed(42)
+n_obs = 200
+time_index = pd.date_range(start='2020-01-01', periods=n_obs, freq='D')
+X = np.random.rand(n_obs) * 10
+
+# Define a threshold variable (e.g., another feature, or a lagged version of X, or a time trend)
+Z = np.linspace(0, 10, n_obs) + np.random.normal(0, 0.5, n_obs) # A noisy increasing trend
+true_threshold = 5.0
+
+# Define regimes based on Z
+regime_0_indices = Z <= true_threshold
+regime_1_indices = Z > true_threshold
+
+# Parameters for each regime
+beta0_regime0 = 3
+beta1_regime0 = 0.8 # Positive correlation
+beta0_regime1 = 12
+beta1_regime1 = -1.2 # Negative correlation
+
+y = np.zeros(n_obs)
+y[regime_0_indices] = beta0_regime0 + beta1_regime0 * X[regime_0_indices] + np.random.normal(0, 1, sum(regime_0_indices))
+y[regime_1_indices] = beta0_regime1 + beta1_regime1 * X[regime_1_indices] + np.random.normal(0, 1.5, sum(regime_1_indices))
+
+data = pd.DataFrame({'y': y, 'X': X, 'Z': Z}, index=time_index)
+
+# --- 2. Implement Threshold Regression ---
+
+def fit_threshold_regression(threshold, endog, exog, threshold_var):
+    """
+    Fits a two-regime OLS model based on a given threshold.
+    Returns the sum of squared residuals (SSR).
+    """
+    regime_0_mask = threshold_var <= threshold
+    regime_1_mask = threshold_var > threshold
+
+    y_0, X_0 = endog[regime_0_mask], exog[regime_0_mask]
+    y_1, X_1 = endog[regime_1_mask], exog[regime_1_mask]
+
+    # Ensure there's enough data in each regime
+    if len(y_0) < 2 or len(y_1) < 2: # At least 2 points for regression
+        return np.inf # Return large error if insufficient data
+
+    ssr = 0
+    try:
+        model_0 = sm.OLS(y_0, X_0).fit()
+        ssr += np.sum(model_0.resid**2)
+    except Exception:
+        return np.inf
+
+    try:
+        model_1 = sm.OLS(y_1, X_1).fit()
+        ssr += np.sum(model_1.resid**2)
+    except Exception:
+        return np.inf
+
+    return ssr
+
+# Find the optimal threshold by minimizing SSR
+# We'll search over a grid of possible threshold values for Z
+possible_thresholds = np.linspace(data['Z'].min(), data['Z'].max(), 100) # Or use a more refined search
+
+best_threshold = None
+min_ssr = np.inf
+
+# Prepare data for regression
+X_reg = sm.add_constant(data['X']) # Exogenous variables for regression
+
+# Loop through possible thresholds to find the one minimizing SSR
+# (A more sophisticated method would use an optimization algorithm)
+for threshold_candidate in possible_thresholds:
+    current_ssr = fit_threshold_regression(threshold_candidate, data['y'], X_reg, data['Z'])
+    if current_ssr < min_ssr:
+        min_ssr = current_ssr
+        best_threshold = threshold_candidate
+
+print(f"Optimal Threshold (Z): {best_threshold:.2f} (True: {true_threshold:.2f})")
+
+# Fit the final models with the best threshold
+regime_0_mask_final = data['Z'] <= best_threshold
+regime_1_mask_final = data['Z'] > best_threshold
+
+model_regime0 = sm.OLS(data['y'][regime_0_mask_final], X_reg[regime_0_mask_final]).fit()
+model_regime1 = sm.OLS(data['y'][regime_1_mask_final], X_reg[regime_1_mask_final]).fit()
+
+print("\n--- Regime 0 (Z <= {:.2f}) ---".format(best_threshold))
+print(model_regime0.summary())
+print("\n--- Regime 1 (Z > {:.2f}) ---".format(best_threshold))
+print(model_regime1.summary())
+
+# --- 3. Visualize Results ---
+plt.figure(figsize=(14, 6))
+
+plt.subplot(2, 1, 1)
+plt.scatter(data['Z'], data['y'], c=data['Z'] > true_threshold, cmap='coolwarm', s=20, alpha=0.7, label='Data Points (True Regimes)')
+plt.axvline(true_threshold, color='green', linestyle='--', label='True Threshold')
+plt.axvline(best_threshold, color='red', linestyle='-', label='Estimated Threshold')
+plt.title('Data Colored by True Regime and Estimated Threshold')
+plt.xlabel('Threshold Variable (Z)')
+plt.ylabel('y')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(2, 1, 2)
+# Plot estimated regression lines
+x_plot = np.linspace(X.min(), X.max(), 100)
+X_plot_const = sm.add_constant(x_plot)
+
+# Regime 0 line
+y_plot_reg0 = model_regime0.predict(X_plot_const)
+plt.plot(x_plot, y_plot_reg0, color='blue', label='Estimated Regression Line (Regime 0)')
+plt.scatter(data['X'][regime_0_mask_final], data['y'][regime_0_mask_final], color='blue', alpha=0.5, s=10)
+
+# Regime 1 line
+y_plot_reg1 = model_regime1.predict(X_plot_const)
+plt.plot(x_plot, y_plot_reg1, color='red', label='Estimated Regression Line (Regime 1)')
+plt.scatter(data['X'][regime_1_mask_final], data['y'][regime_1_mask_final], color='red', alpha=0.5, s=10)
+
+plt.title('Regression Lines for Estimated Regimes (Based on X)')
+plt.xlabel('X')
+plt.ylabel('y')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
