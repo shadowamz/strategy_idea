@@ -1,0 +1,140 @@
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from statsmodels.tsa.regime_switching.markov_autoregression import MarkovAutoregression
+import matplotlib.pyplot as plt
+
+# --- 1. Simulate Data (Example) ---
+np.random.seed(42)
+n_obs = 300
+time_index = pd.date_range(start='2015-01-01', periods=n_obs, freq='D')
+X = np.random.rand(n_obs) * 10
+
+# Define two regimes with different parameters
+# Regime 0: Low intercept, positive slope (weak correlation)
+# Regime 1: High intercept, negative slope (strong negative correlation)
+beta0_regime0 = 2
+beta1_regime0 = 0.5
+
+beta0_regime1 = 10
+beta1_regime1 = -1.5
+
+# Simulate regime transitions (e.g., some manual switches)
+true_regimes = np.zeros(n_obs, dtype=int)
+true_regimes[50:100] = 1 # Regime 1
+true_regimes[150:200] = 0 # Back to Regime 0
+true_regimes[250:] = 1 # Back to Regime 1
+
+y = np.zeros(n_obs)
+for t in range(n_obs):
+    if true_regimes[t] == 0:
+        y[t] = beta0_regime0 + beta1_regime0 * X[t] + np.random.normal(0, 1)
+    else:
+        y[t] = beta0_regime1 + beta1_regime1 * X[t] + np.random.normal(0, 1.5) # Higher noise in regime 1
+
+data = pd.DataFrame({'y': y, 'X': X}, index=time_index)
+
+# --- 2. Fit Markov Switching Regression Model ---
+# exog_regression: independent variables for the regression component (X_t)
+# k_regimes: number of hidden regimes
+# trend: 'c' for constant/intercept, 'nc' for no constant
+# switching_variance: True if variance also switches across regimes
+# order: not used for pure regression, but kept for consistency with SARIMAX base
+
+# For a pure regression model, we can use MarkovRegression.
+# It uses the general framework of MarkovAutoregression but with AR order 0.
+model = sm.tsa.MarkovRegression(
+    endog=data['y'],
+    exog=sm.add_constant(data['X']), # Add constant for intercept
+    k_regimes=2,
+    transition_is_symmetric=False, # Allow asymmetric transitions
+    switching_ar=False, # AR parameters do not switch (we have no AR terms)
+    switching_exog=True, # Exogenous variable coefficients switch (this is what we want!)
+    switching_variance=True # Allow error variance to switch
+)
+
+# Initial parameter guesses are often crucial for convergence
+# (coeffs for regime 0, coeffs for regime 1, variance for regime 0, variance for regime 1, transition matrix)
+# This can be tricky. Default optimization often works, but sometimes manual guesses help.
+# For example, if you suspect regime 0 has positive slope and regime 1 has negative:
+# start_params_guess = np.array([beta0_regime0, beta1_regime0, beta0_regime1, beta1_regime1, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5]) # This is very complex to guess
+# It's often better to let `fit` try its robust defaults first or use random initializations.
+
+results = model.fit(iter_limit=5000, disp=False) # disp=False to suppress optimization output
+
+print(results.summary())
+
+# --- 3. Extract and Visualize Results ---
+
+# Inferred probabilities of being in each regime
+# smoothed_probabilities: P(S_t = j | Y_1...Y_T)
+# filtered_probabilities: P(S_t = j | Y_1...Y_t)
+inferred_regime_probs = results.smoothed_probabilities[0] # Probability of being in Regime 0
+
+plt.figure(figsize=(14, 8))
+
+plt.subplot(3, 1, 1)
+plt.plot(time_index, y, label='Observed y')
+plt.title('Observed Series and True Regimes')
+plt.ylabel('y')
+plt.scatter(time_index, y, c=true_regimes, cmap='coolwarm', s=10, label='True Regimes (Color)')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(3, 1, 2)
+plt.plot(time_index, inferred_regime_probs, label='Prob. of Regime 0 (Smoothed)')
+plt.plot(time_index, 1 - inferred_regime_probs, label='Prob. of Regime 1 (Smoothed)', linestyle='--')
+plt.axhline(0.5, color='gray', linestyle=':', linewidth=0.8)
+plt.title('Inferred Regime Probabilities')
+plt.ylabel('Probability')
+plt.legend()
+plt.grid(True)
+
+# Plot estimated coefficients for each regime
+# `param_names` helps identify which parameters belong to which regime
+# The order is usually: constant_reg0, exog1_reg0, ..., constant_reg1, exog1_reg1, ...
+# Then variances, then transition probabilities.
+# Check results.param_names for exact order
+estimated_const_reg0 = results.params[0]
+estimated_slope_reg0 = results.params[1]
+estimated_const_reg1 = results.params[2]
+estimated_slope_reg1 = results.params[3]
+
+print(f"\nEstimated Intercept Regime 0: {estimated_const_reg0:.2f} (True: {beta0_regime0:.2f})")
+print(f"Estimated Slope Regime 0: {estimated_slope_reg0:.2f} (True: {beta1_regime0:.2f})")
+print(f"Estimated Intercept Regime 1: {estimated_const_reg1:.2f} (True: {beta0_regime1:.2f})")
+print(f"Estimated Slope Regime 1: {estimated_slope_reg1:.2f} (True: {beta1_regime1:.2f})")
+
+# Transition probabilities: P(S_t = j | S_{t-1} = i)
+# results.params[num_regression_params + num_variance_params:]
+# Transition_00 = results.params[4] # For 2 regimes, it's (k_regimes * k_regimes) = 4 params
+# Transition_01, Transition_10, Transition_11
+# For a 2-state model, parameters are P(S_t=0|S_{t-1}=0), P(S_t=0|S_{t-1}=1)
+# The `transition` matrix is available as `results.regime_transition`
+print("\nEstimated Transition Matrix:")
+print(results.regime_transition)
+
+plt.subplot(3, 1, 3)
+# To plot the actual coefficients over time based on the most probable regime
+# We can take the regime with probability > 0.5
+inferred_max_prob_regime = (results.smoothed_probabilities[1] > 0.5).astype(int) # Which regime has higher prob
+
+estimated_coeffs_over_time = np.zeros((n_obs, 2)) # [intercept, slope]
+for t in range(n_obs):
+    if inferred_max_prob_regime[t] == 0:
+        estimated_coeffs_over_time[t, 0] = estimated_const_reg0
+        estimated_coeffs_over_time[t, 1] = estimated_slope_reg0
+    else:
+        estimated_coeffs_over_time[t, 0] = estimated_const_reg1
+        estimated_coeffs_over_time[t, 1] = estimated_slope_reg1
+
+plt.plot(time_index, beta_1_true, label='True Slope', linestyle='--', color='gray')
+plt.plot(time_index, estimated_coeffs_over_time[:, 1], label='Estimated Slope based on Inferred Regime')
+plt.title('Estimated Slope Coefficient Over Time (Based on Inferred Regime)')
+plt.ylabel('Slope')
+plt.xlabel('Date')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
