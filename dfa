@@ -1,0 +1,160 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from fathon import MFDFA # For Multifractal DFA
+
+# --- 1. Generate Sample Intraday-like Data ---
+# Let's create a synthetic price series with varying characteristics.
+# We'll simulate some trending, some ranging, and some random walk parts.
+def generate_synthetic_intraday_data(num_points=10000, trend_strength=0.001, noise_level=0.1):
+    prices = [100.0]
+    trends = [0.0]
+    for i in range(1, num_points):
+        # Simulate a changing trend
+        if 2000 < i < 4000: # Trending up
+            trends.append(trends[-1] + np.random.normal(trend_strength, 0.0001))
+        elif 6000 < i < 8000: # Trending down
+            trends.append(trends[-1] - np.random.normal(trend_strength, 0.0001))
+        else: # More random/ranging
+            trends.append(trends[-1] * 0.99 + np.random.normal(0, 0.0001)) # Decay towards zero
+
+        price_change = trends[-1] + np.random.normal(0, noise_level)
+        prices.append(prices[-1] + price_change)
+
+    # Add a time index to simulate intraday data (e.g., 1-minute intervals)
+    time_index = pd.date_range(start='2024-01-01 09:00', periods=num_points, freq='1min')
+    return pd.Series(prices, index=time_index, name='Price')
+
+print("Generating synthetic data...")
+price_series = generate_synthetic_intraday_data(num_points=15000, trend_strength=0.005, noise_level=0.5)
+print("Synthetic data generated.")
+print(price_series.head())
+
+# --- 2. Calculate Log Returns ---
+# MF-DFA is typically applied to the integrated series of fluctuations,
+# and returns are a good starting point for fluctuations.
+returns = np.log(price_series / price_series.shift(1)).dropna()
+print("\nLog returns calculated.")
+print(returns.head())
+
+# --- 3. MF-DFA Parameters ---
+# Define parameters for the sliding window and MF-DFA calculation
+window_size = 256  # Number of data points in each window (e.g., ~4 hours for 1-min data)
+step_size = 60     # How often to move the window (e.g., every hour for 1-min data)
+
+# Define the 'q' values for MF-DFA. It's crucial to choose a range.
+# Common range: -5 to 5, excluding 0.
+q_values = np.array([-5, -3, -1, 1, 2, 3, 5])
+# scales (box sizes): This determines the range of time scales over which to calculate fluctuations.
+# For intraday, these should cover typical intraday patterns.
+# np.unique is used to avoid duplicate integer scales after logspace.
+scales = np.unique(np.logspace(np.log10(10), np.log10(window_size // 4), 20).astype(int))
+if 0 in scales: scales = scales[scales != 0] # Ensure no zero scale
+print(f"\nMF-DFA parameters:")
+print(f"  Window Size: {window_size}")
+print(f"  Step Size: {step_size}")
+print(f"  Q values: {q_values}")
+print(f"  Scales (box sizes): {scales}")
+
+# Store results
+h_q_over_time = []
+timestamps = []
+
+print(f"\nStarting MF-DFA calculation over sliding windows...")
+# Iterate through the returns series with a sliding window
+for i in range(0, len(returns) - window_size, step_size):
+    window_data = returns.iloc[i : i + window_size]
+
+    if len(window_data) == window_size: # Ensure we have a full window
+        # Create an MFDFA object
+        # You need to pass the time series (as a numpy array)
+        # and the order of polynomial for detrending (order=1 for linear detrending, common for DFA/MF-DFA)
+        try:
+            mfdfa_obj = MFDFA(window_data.values, order=1)
+            # Calculate h(q) for the defined q_values and scales
+            h_q, _, _ = mfdfa_obj.calc_h(q=q_values, scales=scales)
+            h_q_over_time.append(h_q)
+            timestamps.append(window_data.index[-1]) # Store the end timestamp of the window
+        except Exception as e:
+            print(f"Error calculating MF-DFA at index {i}: {e}")
+            h_q_over_time.append(np.full_like(q_values, np.nan)) # Append NaNs on error
+            timestamps.append(window_data.index[-1])
+
+print("MF-DFA calculation complete.")
+
+# Convert results to a DataFrame for easier analysis
+h_q_df = pd.DataFrame(h_q_over_time, index=timestamps, columns=[f'h(q={q})' for q in q_values])
+print("\nSample h(q) values over time:")
+print(h_q_df.head())
+
+# --- 4. Visualize Results ---
+
+# Plot the time evolution of specific h(q) values
+plt.figure(figsize=(15, 8))
+plt.plot(h_q_df.index, h_q_df[f'h(q={q_values[0]})'], label=f'h(q={q_values[0]}) (Small fluctuations)')
+plt.plot(h_q_df.index, h_q_df[f'h(q={q_values[len(q_values)//2]})'], label=f'h(q={q_values[len(q_values)//2]}) (Medium fluctuations, around q=0)')
+plt.plot(h_q_df.index, h_q_df[f'h(q={q_values[-1]})'], label=f'h(q={q_values[-1]}) (Large fluctuations)')
+plt.axhline(0.5, color='gray', linestyle='--', label='Random Walk (0.5)')
+plt.title('Time Evolution of Generalized Hurst Exponents h(q)')
+plt.xlabel('Time')
+plt.ylabel('h(q)')
+plt.grid(True, linestyle=':', alpha=0.7)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# Plot multifractal spectra for a few selected time points
+# Pick a few points: start, middle, and end, or interesting points from the above plot
+sample_indices = [0, len(h_q_df) // 3, 2 * len(h_q_df) // 3, len(h_q_df) - 1]
+sample_indices = [idx for idx in sample_indices if idx < len(h_q_df)] # Ensure valid indices
+
+plt.figure(figsize=(12, 6))
+for idx in sample_indices:
+    if idx < len(h_q_df) and not h_q_df.iloc[idx].isnull().all(): # Check for NaNs
+        plt.plot(q_values, h_q_df.iloc[idx].values, '-o', label=f'Spectrum at {h_q_df.index[idx].strftime("%Y-%m-%d %H:%M")}')
+
+plt.axhline(0.5, color='gray', linestyle='--', label='Random Walk (0.5)')
+plt.title('Multifractal Spectra h(q) at Different Time Points')
+plt.xlabel('q value')
+plt.ylabel('h(q)')
+plt.grid(True, linestyle=':', alpha=0.7)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# --- 5. Illustrate Regime Detection Logic ---
+
+print("\n--- Market Regime Detection Based on h(q) ---")
+# Define thresholds for different q values (these need empirical tuning)
+h_q_negative_threshold_reverting = 0.35 # e.g., for h(q=-5)
+h_q_positive_threshold_trending = 0.65  # e.g., for h(q=5)
+h_q_mid_range_random = 0.55             # e.g., for h(q=2)
+
+# Get the column names for specific q values for easier access
+h_neg_q_col = f'h(q={q_values[0]})' # Smallest q (most negative)
+h_pos_q_col = f'h(q={q_values[-1]})' # Largest q (most positive)
+h_mid_q_col = f'h(q={q_values[len(q_values)//2]})' # Mid-range q (around 2)
+
+
+for timestamp, row in h_q_df.iterrows():
+    h_neg = row[h_neg_q_col]
+    h_pos = row[h_pos_q_col]
+    h_mid = row[h_mid_q_col]
+
+    if pd.isna(h_neg) or pd.isna(h_pos) or pd.isna(h_mid):
+        print(f"{timestamp}: Insufficient data for reliable regime detection.")
+        continue
+
+    # Example logic - combine conditions
+    if h_pos > h_q_positive_threshold_trending and h_mid > 0.5:
+        print(f"{timestamp}: **STRONG TRENDING** (Large moves persistent: {h_pos:.2f}, overall persistent: {h_mid:.2f})")
+        # Implement trend-following strategy
+    elif h_neg < h_q_negative_threshold_reverting and h_mid < 0.5:
+        print(f"{timestamp}: **STRONG MEAN-REVERTING** (Small moves anti-persistent: {h_neg:.2f}, overall anti-persistent: {h_mid:.2f})")
+        # Implement mean-reversion strategy
+    elif h_pos > 0.5 and h_neg < 0.5:
+        print(f"{timestamp}: **MIXED REGIME** (Large moves persistent, small moves anti-persistent: h({q_values[-1]})={h_pos:.2f}, h({q_values[0]})={h_neg:.2f})")
+        # This is a common market state: trend on big moves, range on small moves. Adapt strategy accordingly.
+    else:
+        print(f"{timestamp}: **RANDOM/TRANSITIONING** (h({q_values[-1]})={h_pos:.2f}, h({q_values[0]})={h_neg:.2f})")
+        # Reduce exposure or wait for clearer signal
