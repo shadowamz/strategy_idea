@@ -1,0 +1,241 @@
+import numpy as np
+import pandas as pd
+import pymc as pm
+from pytensor.scan import scan # Keep this import, as it's the correct source for scan
+import pytensor.tensor as tt
+import arviz as az
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler
+
+# --- Configuration ---
+np.random.seed(42) # For reproducibility
+n_samples_train = 300  # Number of samples for training
+n_samples_test = 50    # Number of samples for testing (forecasting)
+n_features = 20        # Number of features
+
+# --- 1. Generate Synthetic Data with Time-Varying Coefficients and 20 Features ---
+print("--- 1. Generating Synthetic Data ---")
+# Create a time index
+train_time_index = pd.date_range(start='2020-01-01', periods=n_samples_train, freq='D')
+test_time_index = pd.date_range(start=train_time_index.max() + pd.Timedelta(days=1),
+                                 periods=n_samples_test, freq='D')
+full_time_index = train_time_index.append(test_time_index)
+
+# Generate features (simple random data for now, simulate your 20 features)
+X_data_full = np.random.normal(loc=0, scale=1, size=(len(full_time_index), n_features))
+feature_names = [f'feature_{i+1}' for i in range(n_features)]
+df_X = pd.DataFrame(X_data_full, index=full_time_index, columns=feature_names)
+
+# Simulate time-varying coefficients (intercept + for each feature)
+true_alpha = 5 + np.sin(np.arange(len(full_time_index)) / 20) * 3 # Time-varying intercept
+
+# Create an array to store true betas for all features over time
+true_betas = np.zeros((len(full_time_index), n_features))
+
+# Example: make some coefficients change in distinct ways
+true_betas[:, 0] = 1.0 - (np.arange(len(full_time_index)) / len(full_time_index)) * 2.5
+true_betas[:, 1] = -0.5 + (np.arange(len(full_time_index)) / len(full_time_index)) * 1.5
+true_betas[:, 2] = 0.8 * np.cos(np.arange(len(full_time_index)) / 15)
+
+for i in range(3, n_features):
+    true_betas[:, i] = np.random.uniform(-0.5, 0.5) + np.random.normal(0, 0.05, len(full_time_index)).cumsum() * 0.1
+
+true_sigma = 2.0 # True standard deviation of the noise
+
+# Generate target variable
+y_data_full = true_alpha + np.sum(true_betas * X_data_full, axis=1) + np.random.normal(0, true_sigma, len(full_time_index))
+
+df_y = pd.DataFrame({'target': y_data_full}, index=full_time_index)
+
+print("Generated Data Head (Features and Target):")
+print(pd.concat([df_X.head(), df_y.head()], axis=1))
+print("\nGenerated Data Tail (Features and Target):")
+print(pd.concat([df_X.tail(), df_y.tail()], axis=1))
+
+# --- Plot True Coefficients (for a few features) and Target ---
+plt.figure(figsize=(15, 10))
+
+plt.subplot(min(n_features, 5) + 2, 1, 1) # Space for Alpha and then Betas
+plt.plot(full_time_index, df_y['target'], label='Observed Target', color='orange')
+plt.title('Simulated Observed Target Variable Over Time')
+plt.grid(True)
+plt.legend()
+
+plt.subplot(min(n_features, 5) + 2, 1, 2)
+plt.plot(full_time_index, true_alpha, label='True Alpha (Intercept)', color='blue')
+plt.title('True Time-Varying Intercept')
+plt.grid(True)
+plt.legend()
+
+for i in range(min(n_features, 5)):
+    plt.subplot(min(n_features, 5) + 2, 1, i + 3)
+    plt.plot(full_time_index, true_betas[:, i], label=f'True Beta for Feature {i+1}')
+    plt.title(f'True Time-Varying Slope for Feature {i+1}')
+    plt.grid(True)
+    plt.legend()
+plt.tight_layout()
+plt.show()
+
+# --- 2. Prepare Data for PyMC ---
+print("\n--- 2. Preparing Data for PyMC ---")
+X_train = df_X.iloc[:n_samples_train].values
+Y_train = df_y.iloc[:n_samples_train].values.flatten()
+
+scaler_X = StandardScaler()
+X_train_scaled = scaler_X.fit_transform(X_train)
+X_data_full_scaled = scaler_X.transform(X_data_full)
+
+full_time_idx_py = np.arange(len(full_time_index))
+time_idx_train_py = np.arange(n_samples_train)
+
+print(f"X_train_scaled shape: {X_train_scaled.shape}")
+print(f"Y_train shape: {Y_train.shape}")
+
+# --- 3. Define the PyMC Time-Varying Parameter Regression Model ---
+print("\n--- 3. Defining the PyMC TVP Regression Model ---")
+with pm.Model() as tvp_regression_model:
+    # 3.1. Mutable Data for Features and Time Index
+    X_obs = pm.MutableData('X_obs', X_train_scaled)
+    time_idx_obs = pm.MutableData('time_idx_obs', time_idx_train_py)
+
+    # 3.2. Priors for Initial Parameters and Random Walk Standard Deviations
+    alpha_init = pm.Normal('alpha_init', mu=Y_train.mean(), sigma=10)
+    beta_init = pm.Normal('beta_init', mu=0, sigma=5, shape=n_features)
+
+    sigma_alpha = pm.HalfNormal('sigma_alpha', sigma=1)
+    sigma_beta = pm.HalfNormal('sigma_beta', sigma=1, shape=n_features)
+    sigma_obs = pm.HalfNormal('sigma_obs', sigma=5)
+
+    # --- THE CRITICAL FIX: Define innovations *outside* scan, then accumulate them *deterministically* inside scan ---
+
+    # Innovations for alpha (intercept) random walk
+    # shape=len(full_time_idx_py) ensures there's an innovation for each time step
+    alpha_innovations = pm.Normal('alpha_innovations', mu=0, sigma=sigma_alpha,
+                                  shape=len(full_time_idx_py))
+
+    # Innovations for beta (slopes) random walks
+    # shape=(len(full_time_idx_py), n_features) ensures an innovation for each feature at each time step
+    beta_innovations = pm.Normal('beta_innovations', mu=0, sigma=sigma_beta,
+                                 shape=(len(full_time_idx_py), n_features))
+
+    # 3.3. Time-Varying Parameters (Random Walk using `scan` for deterministic accumulation)
+    # The `fn` now performs a simple addition, making the output deterministic.
+    # The random component comes from `alpha_innovations` which is a `pm.Normal` RV itself.
+
+    # For alpha (intercept): alpha_t = alpha_{t-1} + alpha_innovation_t
+    alpha_sequence, _ = scan(
+        fn=lambda innovation, alpha_prev: alpha_prev + innovation, # deterministic sum
+        sequences=alpha_innovations, # Pass the sequence of innovations
+        outputs_info=dict(initial=alpha_init), # Starting value
+        n_steps=len(full_time_idx_py)
+    )
+    alpha = pm.Deterministic('alpha', alpha_sequence)
+
+    # For betas (slopes for each feature): beta_t_j = beta_{t-1}_j + beta_innovation_t_j
+    beta_sequence, _ = scan(
+        fn=lambda innovation_vec, beta_prev_vec: beta_prev_vec + innovation_vec, # deterministic sum of vectors
+        sequences=beta_innovations, # Pass the sequence of innovation vectors
+        outputs_info=dict(initial=beta_init), # Initial vector for all betas
+        n_steps=len(full_time_idx_py)
+    )
+    beta = pm.Deterministic('beta', beta_sequence)
+
+    # 3.4. Measurement Equation (Likelihood)
+    mu = alpha[time_idx_obs] + tt.sum(beta[time_idx_obs] * X_obs, axis=1)
+    Y_observed = pm.Normal('Y_observed', mu=mu, sigma=sigma_obs, observed=Y_train)
+
+# --- 4. Perform Inference (MCMC Sampling) ---
+print("\n--- 4. Performing MCMC Inference ---")
+with tvp_regression_model:
+    trace = pm.sample(
+        draws=1000,
+        tune=2000,
+        chains=4,
+        cores=4,
+        random_seed=42,
+        target_accept=0.9
+    )
+print("Sampling complete.")
+
+# --- 5. Analyze the Posterior Samples ---
+print("\n--- 5. Analyzing Posterior Samples ---")
+print("\nPosterior Summary of Initial Parameters and Random Walk Volatilities:")
+# Note: beta_innovations and alpha_innovations won't appear here by default as they are
+# intermediate variables. We care about their standard deviations (sigma_alpha, sigma_beta)
+# and the actual alpha/beta sequences themselves.
+print(az.summary(trace, var_names=['alpha_init', 'beta_init', 'sigma_alpha', 'sigma_beta', 'sigma_obs']))
+
+print("\nPlotting MCMC Traces for Diagnostics...")
+az.plot_trace(trace, var_names=['alpha_init', 'beta_init', 'sigma_alpha', 'sigma_beta', 'sigma_obs'])
+plt.tight_layout()
+plt.show()
+
+print("\nPlotting Inferred Time-Varying Coefficients...")
+alpha_posterior_mean = trace.posterior['alpha'].mean(dim=('chain', 'draw')).values
+beta_posterior_mean = trace.posterior['beta'].mean(dim=('chain', 'draw')).values
+
+plt.figure(figsize=(15, 10))
+plt.subplot(min(n_features, 5) + 1, 1, 1)
+plt.plot(full_time_index, true_alpha, 'k--', label='True Alpha')
+plt.plot(full_time_index, alpha_posterior_mean, color='blue', label='Inferred Alpha (Mean Posterior)')
+az.plot_hdi(full_time_index, trace.posterior['alpha'], hdi_prob=0.95, color='blue', fill_kwargs={'alpha': 0.2})
+plt.title('Inferred Time-Varying Intercept (Alpha)')
+plt.legend()
+plt.grid(True)
+
+for i in range(min(n_features, 5)):
+    plt.subplot(min(n_features, 5) + 1, 1, i + 2)
+    plt.plot(full_time_index, true_betas[:, i], 'k--', label=f'True Beta for Feature {i+1}')
+    plt.plot(full_time_index, beta_posterior_mean[:, i], color='red', label=f'Inferred Beta for Feature {i+1} (Mean Posterior)')
+    az.plot_hdi(full_time_index, trace.posterior['beta'][:, :, i], hdi_prob=0.95, color='red', fill_kwargs={'alpha': 0.2})
+    plt.title(f'Inferred Time-Varying Slope for Feature {i+1}')
+    plt.legend()
+    plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# --- 6. Prediction and Evaluation on Test Set ---
+print("\n--- 6. Making Predictions and Evaluating on Test Set ---")
+
+X_test_scaled = scaler_X.transform(df_X.iloc[n_samples_train:].values)
+Y_test = df_y.iloc[n_samples_train:].values.flatten()
+
+with tvp_regression_model:
+    pm.set_data({
+        'X_obs': X_test_scaled,
+        'time_idx_obs': time_idx_train_py[-1] + np.arange(1, n_samples_test + 1)
+    })
+    posterior_predictive = pm.sample_posterior_predictive(trace, extend_inferencedata=True)
+
+y_pred_test_mean = posterior_predictive.posterior_predictive['Y_observed'].mean(dim=('chain', 'draw')).values
+y_pred_test_hdi_lower = az.hdi(posterior_predictive, hdi_prob=0.95)['Y_observed'].sel(hdi_dims="hdi").isel(hdi_intervals=0).values
+y_pred_test_hdi_upper = az.hdi(posterior_predictive, hdi_prob=0.95)['Y_observed'].sel(hdi_dims="hdi").isel(hdi_intervals=1).values
+
+rmse_test = np.sqrt(mean_squared_error(Y_test, y_pred_test_mean))
+print(f"\nRMSE on test set (PyMC Posterior Predictive Mean): {rmse_test:.2f}")
+
+plt.figure(figsize=(14, 7))
+plt.plot(test_time_index, Y_test, label='Observed Target (Test)', color='blue', alpha=0.7)
+plt.plot(test_time_index, y_pred_test_mean, label='Predicted Mean (Test)', color='red', linestyle='--')
+plt.fill_between(test_time_index, y_pred_test_hdi_lower, y_pred_test_hdi_upper, color='red', alpha=0.2, label='95% HDI')
+plt.title(f'PyMC Multi-Feature TVP Regression: Predictions on Test Set (RMSE: {rmse_test:.2f})')
+plt.xlabel('Date')
+plt.ylabel('Target Value')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# --- 7. Residual Analysis ---
+print("\n--- 7. Analyzing Residuals on Test Set ---")
+residuals = Y_test - y_pred_test_mean
+plt.figure(figsize=(12, 4))
+plt.plot(test_time_index, residuals)
+plt.axhline(0, color='gray', linestyle='--')
+plt.title('Residuals on Test Set')
+plt.xlabel('Date')
+plt.ylabel('Residual')
+plt.grid(True)
+plt.show()
+
+print("\nCode Execution Complete.")
