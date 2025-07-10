@@ -1,0 +1,277 @@
+# -*- coding: utf-8 -*-
+"""
+Implémentation du modèle FEEMD-PE-SSA-BP pour la prédiction de séries temporelles.
+Ce script suit la méthodologie de l'article "Short-term wind speed prediction 
+based on FEEMD-PE-SSA-BP".
+
+Dépendances nécessaires :
+pip install numpy pandas scikit-learn EMD-signal ordpy mealpy
+"""
+
+import numpy as np
+import pandas as pd
+from PyEMD import EEMD
+import ordpy
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+from mealpy.swarm_based.SSA import OriginalSSA
+import matplotlib.pyplot as plt
+
+# --- ÉTAPE 1: DÉCOMPOSITION DU SIGNAL (EEMD) ---
+def decompose_signal(data, trials=50, noise_width=0.2):
+    """
+    Décompose une série temporelle en utilisant l'Ensemble Empirical Mode Decomposition (EEMD).
+    C'est une alternative pratique à la méthode FEEMD de l'article.
+    
+    Args:
+        data (np.array): La série temporelle originale.
+        trials (int): Le nombre d'essais pour l'EEMD.
+        noise_width (float): L'amplitude du bruit blanc ajouté.
+
+    Returns:
+        np.array: Un tableau contenant les Fonctions de Mode Intrinsèques (IMFs).
+    """
+    print("Début de la décomposition du signal avec EEMD...")
+    eemd = EEMD(trials=trials, noise_width=noise_width)
+    imfs = eemd(data)
+    print(f"Décomposition terminée. {len(imfs)} composantes (IMFs) trouvées.")
+    return imfs
+
+# --- ÉTAPE 2: ENTROPIE DE PERMUTATION ET REGROUPEMENT ---
+def calculate_permutation_entropy(imfs, dimension=6, delay=1):
+    """
+    Calcule l'entropie de permutation pour chaque composante IMF.
+    
+    Args:
+        imfs (list of np.array): La liste des composantes IMF.
+        dimension (int): La dimension d'intégration pour le calcul de l'entropie.
+        delay (int): Le délai temporel.
+
+    Returns:
+        list: Une liste des valeurs d'entropie de permutation.
+    """
+    print("Calcul de l'entropie de permutation pour chaque IMF...")
+    pe_values = []
+    for i, imf in enumerate(imfs):
+        pe = ordpy.permutation_entropy(imf, dimension=dimension, delay=delay)
+        pe_values.append(pe)
+        print(f"  - IMF {i}: PE = {pe:.4f}")
+    return pe_values
+
+def merge_components(imfs, pe_values, threshold=0.1):
+    """
+    Regroupe les composantes IMF ayant des valeurs d'entropie de permutation similaires.
+    
+    Args:
+        imfs (list of np.array): La liste des composantes IMF.
+        pe_values (list): La liste des valeurs d'entropie.
+        threshold (float): Le seuil de différence pour regrouper.
+
+    Returns:
+        list: Une liste des nouvelles composantes regroupées (NIMFs).
+    """
+    print("Regroupement des composantes avec des entropies similaires...")
+    if not imfs:
+        return []
+
+    nimfs = []
+    current_group = [imfs[0]]
+    last_pe = pe_values[0]
+
+    for i in range(1, len(imfs)):
+        if abs(pe_values[i] - last_pe) < threshold:
+            current_group.append(imfs[i])
+        else:
+            nimfs.append(np.sum(current_group, axis=0))
+            current_group = [imfs[i]]
+        last_pe = pe_values[i]
+    
+    nimfs.append(np.sum(current_group, axis=0)) # Ajouter le dernier groupe
+    print(f"{len(imfs)} IMFs ont été regroupées en {len(nimfs)} nouvelles composantes (NIMFs).")
+    return nimfs
+
+# --- ÉTAPE 3: MODÈLE DE PRÉDICTION SSA-BP ---
+
+def create_dataset(sequence, look_back=10):
+    """
+    Crée un jeu de données supervisé à partir d'une série temporelle.
+    
+    Args:
+        sequence (np.array): La série temporelle.
+        look_back (int): Le nombre de pas de temps précédents à utiliser comme entrée.
+
+    Returns:
+        tuple: (X, y) où X sont les caractéristiques et y est la cible.
+    """
+    X, y = [], []
+    for i in range(len(sequence) - look_back):
+        X.append(sequence[i:(i + look_back)])
+        y.append(sequence[i + look_back])
+    return np.array(X), np.array(y)
+
+class SSABPModel:
+    """
+    Encapsule la logique de l'optimisation d'un réseau de neurones BP
+    par l'algorithme Sparrow Search (SSA).
+    """
+    def __init__(self, problem_size, hidden_layer_sizes=(5,), look_back=10):
+        self.problem_size = problem_size
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.look_back = look_back
+        self.model = MLPRegressor(
+            hidden_layer_sizes=self.hidden_layer_sizes,
+            activation='tanh',
+            solver='adam',
+            max_iter=1, # On contrôle l'entraînement manuellement
+            warm_start=True
+        )
+
+    def _decode_solution(self, solution):
+        """Décode un vecteur solution en poids et biais pour le modèle MLP."""
+        pointer = 0
+        coefs = []
+        # Couche d'entrée -> couche cachée
+        w_input_hidden = solution[pointer:pointer + self.look_back * self.hidden_layer_sizes[0]].reshape((self.look_back, self.hidden_layer_sizes[0]))
+        pointer += self.look_back * self.hidden_layer_sizes[0]
+        coefs.append(w_input_hidden)
+        
+        # Couche cachée -> couche de sortie
+        w_hidden_output = solution[pointer:pointer + self.hidden_layer_sizes[0] * 1].reshape((self.hidden_layer_sizes[0], 1))
+        pointer += self.hidden_layer_sizes[0] * 1
+        coefs.append(w_hidden_output)
+        
+        intercepts = []
+        # Biais de la couche cachée
+        b_hidden = solution[pointer:pointer + self.hidden_layer_sizes[0]]
+        pointer += self.hidden_layer_sizes[0]
+        intercepts.append(b_hidden)
+
+        # Biais de la couche de sortie
+        b_output = solution[pointer:pointer + 1]
+        intercepts.append(b_output)
+
+        return coefs, intercepts
+
+    def objective_function(self, solution):
+        """Fonction objectif pour l'optimiseur SSA."""
+        try:
+            coefs, intercepts = self._decode_solution(solution)
+            
+            # Initialise le modèle avec la solution (poids et biais)
+            self.model.coefs_ = coefs
+            self.model.intercepts_ = intercepts
+            
+            # Entraîner pour une époque et obtenir l'erreur
+            self.model.fit(self.X_train, self.y_train)
+            
+            return self.model.loss_
+        except Exception as e:
+            # En cas d'erreur (par ex. solution invalide), retourner une pénalité élevée
+            return 1e10
+
+    def train(self, X_train, y_train, epoch=50, pop_size=30):
+        """
+        Entraîne le modèle en utilisant SSA pour trouver les poids optimaux.
+        """
+        self.X_train = X_train
+        self.y_train = y_train
+
+        # Définir le problème pour l'optimiseur mealpy
+        problem_dict = {
+            "fit_func": self.objective_function,
+            "lb": [-1] * self.problem_size,
+            "ub": [1] * self.problem_size,
+            "minmax": "min",
+        }
+
+        # Configurer et exécuter l'optimiseur SSA
+        print(f"  Lancement de l'optimisation SSA (Epochs={epoch}, PopSize={pop_size})...")
+        ssa_optimizer = OriginalSSA(epoch=epoch, pop_size=pop_size)
+        best_solution, best_fitness = ssa_optimizer.solve(problem_dict)
+        print(f"  Optimisation terminée. Meilleure erreur trouvée: {best_fitness:.6f}")
+
+        # Configurer le modèle final avec la meilleure solution trouvée
+        best_coefs, best_intercepts = self._decode_solution(best_solution)
+        self.model.coefs_ = best_coefs
+        self.model.intercepts_ = best_intercepts
+        
+        # Entraîner le modèle final un peu plus longtemps pour affiner
+        self.model.max_iter = 200
+        self.model.fit(self.X_train, self.y_train)
+
+    def predict(self, X_test):
+        """Faire des prédictions avec le modèle entraîné."""
+        return self.model.predict(X_test)
+
+# --- ÉTAPE 4: EXÉCUTION DU MODÈLE COMPLET ---
+if __name__ == "__main__":
+    # 1. Générer des données de vitesse de vent synthétiques pour la démonstration
+    print("Génération de données synthétiques...")
+    time = np.linspace(0, 400, 1000)
+    # Une tendance de fond + une composante saisonnière + du bruit
+    wind_speed_data = 5 + 0.01 * time + 2 * np.sin(time / 10) + 1.5 * np.sin(time/3) + np.random.randn(1000) * 0.5
+    
+    # 2. Décomposer le signal
+    imfs = decompose_signal(wind_speed_data)
+    
+    # 3. Calculer PE et regrouper les composantes
+    pe_values = calculate_permutation_entropy(imfs)
+    nimfs = merge_components(imfs, pe_values, threshold=0.1)
+    
+    # 4. Préparer les données pour l'entraînement et le test
+    train_size = int(len(wind_speed_data) * 0.8)
+    
+    total_predictions = np.zeros(len(wind_speed_data) - train_size)
+    look_back = 15 # Nombre de pas de temps à regarder en arrière
+
+    # 5. Entraîner un modèle SSA-BP pour chaque NIMF et prédire
+    print("\n--- Début de l'entraînement et de la prédiction pour chaque NIMF ---")
+    for i, nimf in enumerate(nimfs):
+        print(f"\nTraitement de la NIMF {i+1}/{len(nimfs)}...")
+        
+        # Normaliser chaque composante
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        nimf_scaled = scaler.fit_transform(nimf.reshape(-1, 1)).flatten()
+
+        # Créer le jeu de données
+        X, y = create_dataset(nimf_scaled, look_back)
+        
+        X_train, X_test = X[:train_size-look_back], X[train_size-look_back:]
+        y_train, y_test = y[:train_size-look_back], y[train_size-look_back:]
+        
+        # Calculer la taille du problème (nombre total de poids et biais)
+        # (look_back * h) + (h * 1) + h + 1
+        hidden_nodes = 5
+        problem_size = (look_back * hidden_nodes) + (hidden_nodes * 1) + hidden_nodes + 1
+
+        # Créer et entraîner le modèle SSA-BP
+        ssa_bp = SSABPModel(problem_size=problem_size, hidden_layer_sizes=(hidden_nodes,), look_back=look_back)
+        ssa_bp.train(X_train, y_train, epoch=20, pop_size=15) # Paramètres réduits pour une exécution rapide
+        
+        # Faire les prédictions
+        predictions_scaled = ssa_bp.predict(X_test)
+        
+        # Dénormaliser les prédictions
+        predictions = scaler.inverse_transform(predictions_scaled.reshape(-1, 1)).flatten()
+        
+        # Ajouter les prédictions de cette composante au total
+        total_predictions += predictions
+
+    # 6. Évaluer le résultat final
+    actual_values = wind_speed_data[train_size:]
+    final_rmse = np.sqrt(mean_squared_error(actual_values, total_predictions))
+    print(f"\n--- Évaluation Finale ---")
+    print(f"RMSE de la prédiction finale: {final_rmse:.4f}")
+
+    # 7. Visualiser les résultats
+    plt.figure(figsize=(15, 7))
+    plt.title("Prédiction de Vitesse du Vent avec le Modèle FEEMD-PE-SSA-BP")
+    plt.plot(range(len(wind_speed_data)), wind_speed_data, label="Données Originales", color='gray', alpha=0.6)
+    plt.plot(range(train_size, len(wind_speed_data)), actual_values, label="Valeurs Réelles (Test)", color='blue')
+    plt.plot(range(train_size, len(wind_speed_data)), total_predictions, label="Prédictions du Modèle", color='red', linestyle='--')
+    plt.xlabel("Points de Temps")
+    plt.ylabel("Vitesse du Vent (m/s)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
