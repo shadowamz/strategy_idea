@@ -1,0 +1,147 @@
+# Période pour le RSI
+rsi_period = 14
+
+# 1. Calculer la différence de prix
+delta = df['Close'].diff()
+
+# 2. Séparer les gains et les pertes
+gain = delta.where(delta > 0, 0)
+loss = -delta.where(delta < 0, 0)
+
+# 3. Calculer la moyenne des gains et des pertes sur la période RSI
+avg_gain = gain.rolling(window=rsi_period, min_periods=1).mean()
+avg_loss = loss.rolling(window=rsi_period, min_periods=1).mean()
+
+# 4. Calculer la force relative (RS)
+rs = avg_gain / avg_loss
+
+# 5. Calculer le RSI
+df['RSI_14'] = 100 - (100 / (1 + rs))
+
+# Pour une version plus lisse du RSI (plus commune), on utilise une MME pour les moyennes
+# avg_gain = gain.ewm(com=rsi_period - 1, adjust=False).mean()
+# avg_loss = loss.ewm(com=rsi_period - 1, adjust=False).mean()
+
+
+# Périodes pour le MACD
+fast_period = 12
+slow_period = 26
+signal_period = 9
+
+# 1. Calculer la MME rapide et lente
+ema_fast = df['Close'].ewm(span=fast_period, adjust=False).mean()
+ema_slow = df['Close'].ewm(span=slow_period, adjust=False).mean()
+
+# 2. Calculer la ligne MACD
+df['MACD'] = ema_fast - ema_slow
+
+# 3. Calculer la ligne de signal (MME de la ligne MACD)
+df['Signal_Line'] = df['MACD'].ewm(span=signal_period, adjust=False).mean()
+
+# 4. Calculer l'histogramme
+df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
+
+
+# Période et nombre d'écarts-types
+bb_period = 20
+std_dev = 2
+
+# 1. Calculer la bande du milieu (MMS)
+df['BB_Middle'] = df['Close'].rolling(window=bb_period).mean()
+
+# 2. Calculer l'écart-type sur la période
+df['BB_Std'] = df['Close'].rolling(window=bb_period).std()
+
+# 3. Calculer la bande supérieure et inférieure
+df['BB_Upper'] = df['BB_Middle'] + (df['BB_Std'] * std_dev)
+df['BB_Lower'] = df['BB_Middle'] - (df['BB_Std'] * std_dev)
+
+# Suppression des colonnes de calcul intermédiaires si désiré
+df.drop('BB_Std', axis=1, inplace=True)
+
+
+# pip install statsmodels
+import statsmodels.api as sm
+
+# Utilisons les mêmes données que précédemment
+df.dropna(inplace=True)
+
+# Modèle de régression avec changement de régime sur la volatilité (switching variance)
+# Nous supposons 2 régimes (k_regimes=2)
+model = sm.tsa.MarkovRegression(
+    df['returns'], 
+    k_regimes=2, 
+    trend='c', # 'c' pour une moyenne constante dans chaque régime
+    switching_variance=True # C'est la clé : la variance peut changer
+)
+
+result = model.fit()
+
+# Afficher les probabilités lissées d'être dans chaque régime
+print(result.summary())
+
+# Visualisation des probabilités
+fig, axes = plt.subplots(2, figsize=(12, 8))
+axes[0].plot(result.smoothed_marginal_probabilities[0])
+axes[0].set_title('Probabilité du Régime 0 (Basse Volatilité)')
+
+axes[1].plot(result.smoothed_marginal_probabilities[1])
+axes[1].set_title('Probabilité du Régime 1 (Haute Volatilité)')
+
+plt.tight_layout()
+plt.show()
+
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+
+# Création de données d'exemple plus réalistes
+np.random.seed(42)
+n_samples = 500
+price = 100 + np.random.randn(n_samples).cumsum()
+volume = np.random.randint(100, 500, size=n_samples)
+
+df = pd.DataFrame({'Close': price, 'Volume': volume})
+
+# -- Création de la variable à prédire (Target) --
+# Rendement futur (return à t+1), que l'on essaie de prédire à t
+df['return'] = df['Close'].pct_change().shift(-1) 
+
+# -- Création des caractéristiques prédictives (Features) --
+# 1. Momentum sur 5 périodes
+df['momentum'] = df['Close'].pct_change(periods=5)
+
+# 2. Variation du volume
+df['volume_change'] = df['Volume'].pct_change()
+
+# Nettoyage des données (supprimer les NaN créés par les calculs)
+df.dropna(inplace=True)
+
+# Définition des variables pour le modèle
+# endog = variable endogène (celle qu'on veut prédire)
+y = df['return']
+# exog = variables exogènes (nos caractéristiques)
+X = df[['momentum', 'volume_change']]
+X = sm.add_constant(X) # Important: ajouter une constante pour l'intercept
+
+
+# Définition du modèle avec 2 régimes
+# k_regimes=2: On suppose deux états (ex: "calme" et "volatile")
+# switching_variance=True: La volatilité peut être différente dans chaque régime
+# switching_trend='c': L'intercept (le rendement de base) peut être différent
+model = sm.tsa.MarkovRegression(
+    endog=y, 
+    k_regimes=2, 
+    exog=X, 
+    switching_variance=True,
+    switching_trend=False # Les coefficients de nos features changent
+)
+
+# Entraînement du modèle
+result = model.fit()
+
+# Affichage du résumé des résultats
+print(result.summary())
+
+https://github.com/Zhang-zongwei/MFWPN
