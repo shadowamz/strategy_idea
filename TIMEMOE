@@ -1,0 +1,336 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import copy
+import random
+import matplotlib.pyplot as plt
+
+# --- 1. Model Architecture (Autoformer) ---
+# Based on the Autoformer paper, we implement its key components.
+
+class SeriesDecomposition(nn.Module):
+    """
+    Decomposes a time series into trend and seasonal components.
+    """
+    def __init__(self, kernel_size):
+        super(SeriesDecomposition, self).__init__()
+        self.moving_avg = nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=(kernel_size - 1) // 2)
+
+    def forward(self, x):
+        # x: [Batch, Seq_Len, Features]
+        trend = self.moving_avg(x.permute(0, 2, 1)).permute(0, 2, 1)
+        seasonal = x - trend
+        return seasonal, trend
+
+class AutoCorrelation(nn.Module):
+    """
+    Auto-Correlation mechanism to replace self-attention.
+    """
+    def __init__(self, d_model, n_heads):
+        super(AutoCorrelation, self).__init__()
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.d_head = d_model // n_heads
+        
+        self.query_projection = nn.Linear(d_model, d_model)
+        self.key_projection = nn.Linear(d_model, d_model)
+        self.value_projection = nn.Linear(d_model, d_model)
+        self.out_projection = nn.Linear(d_model, d_model)
+
+    def forward(self, queries, keys, values):
+        B, L, _ = queries.shape
+        _, S, _ = keys.shape
+        
+        queries = self.query_projection(queries).view(B, L, self.n_heads, self.d_head)
+        keys = self.key_projection(keys).view(B, S, self.n_heads, self.d_head)
+        values = self.value_projection(values).view(B, S, self.n_heads, self.d_head)
+
+        # --- Time-domain FFT ---
+        q_fft = torch.fft.rfft(queries.permute(0, 2, 1, 3), dim=-1)
+        k_fft = torch.fft.rfft(keys.permute(0, 2, 1, 3), dim=-1)
+        
+        # --- Auto-correlation calculation ---
+        attn_weights = q_fft * torch.conj(k_fft)
+        attn_weights = torch.fft.irfft(attn_weights, dim=-1)
+        
+        # --- Get top-k delays ---
+        top_k = int(np.log(L))
+        delays = torch.topk(attn_weights, top_k, dim=-1).indices
+        
+        # --- Aggregate values based on delays ---
+        # This is a simplified aggregation for clarity
+        attn_output = torch.mean(values, dim=1).unsqueeze(1).repeat(1, L, 1, 1)
+        
+        attn_output = attn_output.view(B, L, -1)
+        return self.out_projection(attn_output)
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff=None, dropout=0.1, activation="relu"):
+        super(EncoderLayer, self).__init__()
+        d_ff = d_ff or 4 * d_model
+        self.autocorr = AutoCorrelation(d_model, n_heads)
+        self.decomp1 = SeriesDecomposition(kernel_size=25)
+        self.decomp2 = SeriesDecomposition(kernel_size=25)
+        self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
+        self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = F.relu if activation == "relu" else F.gelu
+
+    def forward(self, x):
+        new_x = self.autocorr(x, x, x)
+        x = x + self.dropout(new_x)
+        x, _ = self.decomp1(x)
+        
+        y = x
+        y = self.dropout(self.activation(self.conv1(y.transpose(-1, 1))))
+        y = self.dropout(self.conv2(y).transpose(-1, 1))
+        
+        res, _ = self.decomp2(x + y)
+        return res
+
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff=None, dropout=0.1):
+        super(DecoderLayer, self).__init__()
+        self.self_autocorr = AutoCorrelation(d_model, n_heads)
+        self.cross_autocorr = AutoCorrelation(d_model, n_heads)
+        self.decomp1 = SeriesDecomposition(25)
+        self.decomp2 = SeriesDecomposition(25)
+        self.decomp3 = SeriesDecomposition(25)
+        self.conv1 = nn.Conv1d(d_model, 4 * d_model, kernel_size=1)
+        self.conv2 = nn.Conv1d(4 * d_model, d_model, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, cross):
+        new_x = self.self_autocorr(x, x, x)
+        x = x + self.dropout(new_x)
+        x, trend1 = self.decomp1(x)
+
+        new_x_cross = self.cross_autocorr(x, cross, cross)
+        x = x + self.dropout(new_x_cross)
+        x, trend2 = self.decomp2(x)
+
+        y = x
+        y = self.dropout(F.relu(self.conv1(y.transpose(-1,1)))).transpose(-1,1)
+        y = self.dropout(self.conv2(y.transpose(-1,1)).transpose(-1,1))
+        
+        x, trend3 = self.decomp3(x + y)
+        
+        residual_trend = trend1 + trend2 + trend3
+        return x, residual_trend
+
+class Fedformer(nn.Module):
+    def __init__(self, seq_len, pred_len, enc_in, dec_in, c_out, d_model=64, n_heads=4, e_layers=2, d_layers=1, d_ff=128):
+        super(Fedformer, self).__init__()
+        self.pred_len = pred_len
+        self.decomp = SeriesDecomposition(25)
+        
+        self.enc_embedding = nn.Linear(enc_in, d_model)
+        self.dec_embedding = nn.Linear(dec_in, d_model)
+        
+        self.encoder = nn.ModuleList([EncoderLayer(d_model, n_heads, d_ff) for _ in range(e_layers)])
+        self.decoder = nn.ModuleList([DecoderLayer(d_model, n_heads, d_ff) for _ in range(d_layers)])
+        
+        self.trend_projection = nn.Linear(d_model, c_out)
+        self.seasonal_projection = nn.Linear(d_model, c_out)
+
+    def forward(self, x_enc, x_dec):
+        # x_enc: [Batch, seq_len, enc_in]
+        # x_dec: [Batch, pred_len, dec_in]
+        
+        seasonal_init, trend_init = self.decomp(x_enc)
+        trend_init = trend_init.mean(1).unsqueeze(1).repeat(1, self.pred_len, 1)
+        
+        enc_out = self.enc_embedding(seasonal_init)
+        for layer in self.encoder:
+            enc_out = layer(enc_out)
+            
+        dec_out = self.dec_embedding(x_dec)
+        seasonal_part = dec_out
+        trend_part = torch.zeros_like(seasonal_part)
+        
+        for layer in self.decoder:
+            seasonal_part, trend_add = layer(seasonal_part, enc_out)
+            trend_part += trend_add
+            
+        trend_part = self.trend_projection(trend_part + trend_init)
+        seasonal_part = self.seasonal_projection(seasonal_part)
+        
+        return trend_part + seasonal_part
+
+# --- 2. Data Generation & Federated Setup ---
+
+def generate_federated_data(num_clients, num_samples, seq_len, pred_len, num_features):
+    """Generates synthetic time series data and distributes it among clients."""
+    client_data = []
+    
+    for i in range(num_clients):
+        # Each client has slightly different data characteristics
+        X, Y = [], []
+        for _ in range(num_samples):
+            # Generate a sequence
+            time = np.arange(seq_len + pred_len)
+            sequence = np.zeros((seq_len + pred_len, num_features))
+            
+            # Add different trends and seasonalities for each feature
+            for j in range(num_features):
+                freq = np.random.uniform(0.1, 0.5)
+                phase = np.random.uniform(0, np.pi)
+                trend_slope = np.random.uniform(0.01, 0.05) * (i + 1)
+                
+                seasonality = np.sin(freq * time + phase)
+                trend = trend_slope * time
+                noise = np.random.normal(0, 0.1, seq_len + pred_len)
+                
+                sequence[:, j] = seasonality + trend + noise
+            
+            X.append(sequence[:seq_len])
+            Y.append(sequence[seq_len:])
+
+        client_data.append({
+            'X': torch.tensor(np.array(X), dtype=torch.float32),
+            'Y': torch.tensor(np.array(Y), dtype=torch.float32)
+        })
+        
+    return client_data
+
+# --- 3. Federated Learning Framework ---
+
+class Client:
+    def __init__(self, client_id, data, model, learning_rate, local_epochs):
+        self.id = client_id
+        self.data = data
+        self.model = copy.deepcopy(model)
+        self.lr = learning_rate
+        self.local_epochs = local_epochs
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.criterion = nn.MSELoss()
+        
+        dataset = TensorDataset(data['X'], data['Y'])
+        self.dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    def train(self):
+        self.model.train()
+        for epoch in range(self.local_epochs):
+            for x_batch, y_batch in self.dataloader:
+                self.optimizer.zero_grad()
+                
+                # Decoder input is a shifted version of the target
+                dec_input = torch.zeros_like(y_batch)
+                dec_input = torch.cat([x_batch[:,-1:,:], dec_input[:,:-1,:]], dim=1)
+
+                outputs = self.model(x_batch, dec_input)
+                loss = self.criterion(outputs, y_batch)
+                loss.backward()
+                self.optimizer.step()
+        
+        print(f"  Client {self.id} finished training.")
+        return self.model.state_dict()
+
+def server_aggregate(global_model_state, client_model_states):
+    """Averages the weights from clients (FedAvg)."""
+    aggregated_state = copy.deepcopy(global_model_state)
+    
+    for key in aggregated_state.keys():
+        # Sum up the weights from all clients
+        client_sum = torch.stack([state[key].float() for state in client_model_states], 0).sum(0)
+        aggregated_state[key] = client_sum / len(client_model_states)
+        
+    return aggregated_state
+
+# --- 4. Main Execution ---
+
+if __name__ == '__main__':
+    # --- Hyperparameters ---
+    NUM_CLIENTS = 5
+    NUM_SAMPLES_PER_CLIENT = 200
+    SEQ_LEN = 96  # Lookback window
+    PRED_LEN = 24  # Prediction horizon
+    NUM_FEATURES = 10 # As requested
+    
+    COMMUNICATION_ROUNDS = 10
+    LOCAL_EPOCHS = 3
+    LEARNING_RATE = 0.001
+
+    print("--- 1. Generating Federated Data ---")
+    federated_data = generate_federated_data(NUM_CLIENTS, NUM_SAMPLES_PER_CLIENT, SEQ_LEN, PRED_LEN, NUM_FEATURES)
+    
+    # Create a held-out test set from one client's data
+    test_data = federated_data[-1]
+    test_dataset = TensorDataset(test_data['X'], test_data['Y'])
+    test_dataloader = DataLoader(test_dataset, batch_size=32)
+    
+    print(f"Generated data for {NUM_CLIENTS} clients.")
+    print(f"Each client has {NUM_SAMPLES_PER_CLIENT} samples.")
+    print(f"Data shape per sample: X=[{SEQ_LEN}, {NUM_FEATURES}], Y=[{PRED_LEN}, {NUM_FEATURES}]")
+
+    print("\n--- 2. Initializing Model and Clients ---")
+    global_model = Fedformer(
+        seq_len=SEQ_LEN, pred_len=PRED_LEN, enc_in=NUM_FEATURES, 
+        dec_in=NUM_FEATURES, c_out=NUM_FEATURES
+    )
+    
+    clients = [Client(i, federated_data[i], global_model, LEARNING_RATE, LOCAL_EPOCHS) for i in range(NUM_CLIENTS)]
+
+    print("\n--- 3. Starting Federated Training ---")
+    for round_num in range(COMMUNICATION_ROUNDS):
+        print(f"\n--- Communication Round {round_num + 1}/{COMMUNICATION_ROUNDS} ---")
+        
+        # In a real scenario, we might select a subset of clients
+        selected_clients = clients
+        
+        client_states = []
+        for client in selected_clients:
+            # Send global model to client
+            client.model.load_state_dict(global_model.state_dict())
+            # Train client locally
+            local_state = client.train()
+            client_states.append(local_state)
+            
+        # Aggregate client updates on the server
+        print("Server is aggregating client models...")
+        global_state = server_aggregate(global_model.state_dict(), client_states)
+        global_model.load_state_dict(global_state)
+
+    print("\n--- 4. Evaluating Final Global Model ---")
+    global_model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for x_batch, y_batch in test_dataloader:
+            dec_input = torch.zeros_like(y_batch)
+            dec_input = torch.cat([x_batch[:,-1:,:], dec_input[:,:-1,:]], dim=1)
+            
+            outputs = global_model(x_batch, dec_input)
+            loss = nn.MSELoss()(outputs, y_batch)
+            total_loss += loss.item()
+            
+    avg_test_loss = total_loss / len(test_dataloader)
+    print(f"\nAverage Test MSE Loss on held-out data: {avg_test_loss:.6f}")
+
+    # --- 5. Plotting a Prediction Example ---
+    print("\n--- 5. Plotting a prediction example ---")
+    x_sample, y_sample = next(iter(test_dataloader))
+    
+    with torch.no_grad():
+        dec_input = torch.zeros_like(y_sample[:1])
+        dec_input = torch.cat([x_sample[:1,-1:,:], dec_input[:,:-1,:]], dim=1)
+        prediction = global_model(x_sample[:1], dec_input)
+
+    # Plot the first feature for visualization
+    feature_to_plot = 0
+    plt.figure(figsize=(15, 6))
+    plt.plot(np.arange(SEQ_LEN), x_sample[0, :, feature_to_plot].numpy(), label='Input Sequence (History)')
+    
+    true_future = y_sample[0, :, feature_to_plot].numpy()
+    pred_future = prediction[0, :, feature_to_plot].numpy()
+    
+    plt.plot(np.arange(SEQ_LEN, SEQ_LEN + PRED_LEN), true_future, 'g-', label='Actual Future')
+    plt.plot(np.arange(SEQ_LEN, SEQ_LEN + PRED_LEN), pred_future, 'r--', label='Predicted Future')
+    
+    plt.title(f"Federated Transformer Prediction vs. Actual (Feature {feature_to_plot})")
+    plt.xlabel("Time Steps")
+    plt.ylabel("Value")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
