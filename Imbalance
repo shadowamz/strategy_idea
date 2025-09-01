@@ -1,0 +1,303 @@
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, Dict
+import math
+
+# ---------- Kernel: Mixture-of-Exponentials ≈ 1/sqrt(t+eps) ----------
+
+@dataclass
+class KernelMixturePowerLaw:
+    H: float = 120.0
+    eps: float = 0.1
+    M: int = 8
+    tau_min: float = 0.25
+    tau_max: float = 300.0
+    coeffs_: Optional[np.ndarray] = None
+    taus_: Optional[np.ndarray] = None
+
+    def __post_init__(self):
+        self.taus_ = np.geomspace(self.tau_min, self.tau_max, self.M)
+        t_grid = np.geomspace(self.eps, self.H, 500)
+        K_target = 1.0 / np.sqrt(t_grid + self.eps)
+        A = np.exp(-np.outer(t_grid, 1.0 / self.taus_))
+        ridge = 1e-8 * np.eye(self.M)
+        self.coeffs_ = np.linalg.lstsq(A.T @ A + ridge, A.T @ K_target, rcond=None)[0]
+
+    def evaluate(self, t: np.ndarray) -> np.ndarray:
+        t = np.asarray(t, dtype=float)
+        t = np.maximum(t, 0.0)
+        A = np.exp(-np.outer(t, 1.0 / self.taus_))
+        return A @ self.coeffs_
+
+    def step_update(self, S: np.ndarray, dt: float, inc: float) -> np.ndarray:
+        decay = np.exp(-dt / self.taus_)
+        S = decay * S + inc
+        return S
+
+    def dot_states(self, S: np.ndarray) -> float:
+        return float(np.dot(self.coeffs_, S))
+
+# ---------- Lee–Ready sign (fallback) ----------
+
+def lee_ready_sign(trade_price: float, trade_ts: float, mid_series: pd.Series, prev_price: float) -> int:
+    idx = mid_series.index.searchsorted(trade_ts, side="right") - 1
+    idx = max(idx, 0)
+    mid = mid_series.iloc[idx]
+    if trade_price > mid:
+        return 1
+    elif trade_price < mid:
+        return -1
+    else:
+        if trade_price > prev_price:
+            return 1
+        elif trade_price < prev_price:
+            return -1
+        return 1
+
+# ---------- Streaming generalized OFI ----------
+
+@dataclass
+class GeneralizedOFIStreamer:
+    a: float = 0.5
+    kernel: KernelMixturePowerLaw = field(default_factory=KernelMixturePowerLaw)
+    states_: Optional[np.ndarray] = None
+    last_ts_: Optional[float] = None
+
+    def reset(self):
+        self.states_ = np.zeros(self.kernel.M, dtype=float)
+        self.last_ts_ = None
+
+    def update_trade(self, ts: float, signed_qty: float):
+        if self.states_ is None:
+            self.reset()
+        if self.last_ts_ is None:
+            dt = 0.0
+        else:
+            dt = max(0.0, ts - self.last_ts_)
+        self.states_ = self.kernel.step_update(self.states_, dt, signed_qty)
+        self.last_ts_ = ts
+
+    def value(self) -> float:
+        if self.states_ is None:
+            return 0.0
+        return self.kernel.dot_states(self.states_)
+
+# ---------- Online EWLS (ridge) ----------
+
+@dataclass
+class OnlineEWLS:
+    lam: float = 1e-4
+    alpha: float = 0.05
+    m_xx: float = 1e-6
+    m_xy: float = 0.0
+    beta_: float = 0.0
+    def update(self, x: float, y: float):
+        self.m_xx = (1 - self.alpha) * self.m_xx + self.alpha * (x * x)
+        self.m_xy = (1 - self.alpha) * self.m_xy + self.alpha * (x * y)
+        self.beta_ = self.m_xy / (self.m_xx + self.lam)
+    def predict(self, x: float) -> float:
+        return self.beta_ * x
+
+# ---------- Strategy Engine ----------
+
+@dataclass
+class HFAlphaConfig:
+    a: float = 0.5
+    H: float = 60.0
+    resample_dt: float = 1.0
+    eps: float = 0.05
+    M: int = 10
+    tau_min: float = 0.1
+    tau_max: float = 600.0
+    spread_max_ticks: int = 2
+    min_top_depth: int = 200
+    tick_size: float = 0.01
+    fee_bps: float = 1.0
+    slip_ticks: float = 0.2
+
+class HFAlphaEngine:
+    def __init__(self, cfg: HFAlphaConfig):
+        self.cfg = cfg
+        kernel = KernelMixturePowerLaw(H=cfg.H, eps=cfg.eps, M=cfg.M, tau_min=cfg.tau_min, tau_max=cfg.tau_max)
+        self.streamer = GeneralizedOFIStreamer(a=cfg.a, kernel=kernel)
+        self.beta = OnlineEWLS(lam=1e-4, alpha=0.05)
+
+    def run(self, trades: pd.DataFrame, quotes: pd.DataFrame, lob_top: pd.DataFrame) -> Dict[str, float]:
+        t0 = max(trades['ts'].min(), quotes['ts'].min(), lob_top['ts'].min())
+        t1 = min(trades['ts'].max(), quotes['ts'].max(), lob_top['ts'].max())
+        times = np.arange(math.ceil(t0), math.floor(t1) + 1, self.cfg.resample_dt)
+
+        q_df = quotes.set_index('ts').reindex(times, method='pad').reset_index().rename(columns={'index': 'ts'})
+        l2_df = lob_top.set_index('ts').reindex(times, method='pad').reset_index().rename(columns={'index': 'ts'})
+        mid = (q_df['bid'] + q_df['ask']) / 2.0
+        spread_ticks = (q_df['ask'] - q_df['bid']) / self.cfg.tick_size
+        top_depth = l2_df['bid_sz'] + l2_df['ask_sz']
+
+        trades_sorted = trades.sort_values('ts').reset_index(drop=True)
+        trade_ptr = 0
+        n_trades = len(trades_sorted)
+
+        mid_series = pd.Series(mid.values, index=times)
+        H_steps = int(round(self.cfg.H / self.cfg.resample_dt))
+        fwd_mid = mid_series.shift(-H_steps)
+        rets = np.log(fwd_mid / mid_series).values
+
+        preds = []
+        realized = []
+        pnl = 0.0
+        trade_count = 0
+        notional_traded = 0.0
+
+        self.streamer.reset()
+
+        prev_trade_price = trades_sorted['price'].iloc[0]
+        for idx, t in enumerate(times):
+            while trade_ptr < n_trades and trades_sorted['ts'].iloc[trade_ptr] <= t:
+                row = trades_sorted.iloc[trade_ptr]
+                sign = row['aggressor']
+                if sign == 0 or pd.isna(sign):
+                    sign = lee_ready_sign(row['price'], row['ts'], mid_series, prev_trade_price)
+                signed_qty_a = float(sign) * (float(row['qty']) ** self.streamer.a)
+                self.streamer.update_trade(float(row['ts']), signed_qty_a)
+                prev_trade_price = row['price']
+                trade_ptr += 1
+
+            x = self.streamer.value()
+            gate = (spread_ticks.iloc[idx] <= self.cfg.spread_max_ticks) and (top_depth.iloc[idx] >= self.cfg.min_top_depth)
+            y = rets[idx] if idx < len(rets) else np.nan
+            if not np.isnan(y):
+                self.beta.update(x, y)
+
+            yhat = self.beta.predict(x)
+            preds.append(yhat)
+            realized.append(y)
+
+            half_spread_ticks = spread_ticks.iloc[idx] / 2.0
+            hurdle_ticks = half_spread_ticks + self.cfg.slip_ticks
+            # Avoid division by zero
+            mnow = max(mid_series.iloc[idx], 1e-6)
+            hurdle_ret = (hurdle_ticks * self.cfg.tick_size) / mnow
+            if gate and not np.isnan(y) and abs(yhat) > hurdle_ret:
+                direction = 1.0 if yhat > 0 else -1.0
+                size = 1.0
+                trade_count += 1
+                notional_traded += size * mnow
+                fee = self.cfg.fee_bps * 1e-4 * mnow
+                entry_cost = half_spread_ticks * self.cfg.tick_size + fee + self.cfg.slip_ticks * self.cfg.tick_size
+                exit_cost = half_spread_ticks * self.cfg.tick_size + fee + self.cfg.slip_ticks * self.cfg.tick_size
+                pnl += direction * mnow * y - (entry_cost + exit_cost)
+
+        preds = np.array(preds)
+        realized = np.array(realized)
+        mask = np.isfinite(preds) & np.isfinite(realized)
+        corr = float(np.corrcoef(preds[mask], realized[mask])[0,1]) if mask.sum() > 10 else float('nan')
+        avg_trade_size = notional_traded / max(trade_count, 1)
+        sharpe_like = np.mean(preds[mask]) / (np.std(preds[mask]) + 1e-9) if mask.sum() > 1 else float('nan')
+
+        return {
+            "corr_pred_realized": corr,
+            "beta_hat": self.beta.beta_,
+            "n_trades": trade_count,
+            "pnl_price_units": pnl,
+            "avg_trade_notional": avg_trade_size,
+            "obs_count": int(mask.sum()),
+            "sharpe_like_of_preds": float(sharpe_like),
+        }
+
+# ---------- Synthetic L1/L2 generator ----------
+
+def synthetic_l1_l2_stable(seed: int = 42, T: float = 7200.0, resample_dt: float = 0.01,
+                            metaorder_rate: float = 1/60.0,
+                            child_rate: float = 5.0,
+                            mu: float = 0.5,
+                            q_alpha: float = 1.5,
+                            base_spread_ticks: int = 1,
+                            tick_size: float = 0.01) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    rng = np.random.default_rng(seed)
+    n_steps = int(T / resample_dt)
+    times_grid = np.arange(n_steps) * resample_dt
+    starts = rng.random(n_steps) < (metaorder_rate * resample_dt)
+    s0 = 10.0
+    sign_series = np.zeros(n_steps, dtype=int)
+    for t_idx in range(n_steps):
+        if starts[t_idx]:
+            u = rng.random()
+            dur = s0 * ((1 - u) ** (-1.0 / mu) - 1.0)
+            end_idx = min(n_steps - 1, t_idx + int(dur / resample_dt))
+            sign = 1 if rng.random() < 0.5 else -1
+            sign_series[t_idx:end_idx+1] += sign
+
+    active_intensity = np.abs(sign_series) * child_rate * resample_dt
+    trades_ts, trades_price, trades_qty, trades_sign = [], [], [], []
+
+    kernel = KernelMixturePowerLaw(H=300.0, eps=0.05, M=10, tau_min=0.1, tau_max=600.0)
+    S_states = np.zeros(kernel.M)
+    last_time = 0.0
+    mid = [100.0]
+    a_true = 0.5
+    impact_scale = 1e-4 * tick_size
+    noise_scale = 0.02 * tick_size
+
+    for i, t in enumerate(times_grid[1:], start=1):
+        n_child = rng.poisson(active_intensity[i])
+        if n_child > 0:
+            for _ in range(n_child):
+                q = 1.0 + rng.pareto(q_alpha)
+                sgn = 1 if sign_series[i] >= 0 else -1
+                inc = sgn * (q ** a_true)
+                dt = (t - last_time)
+                S_states = kernel.step_update(S_states, dt, inc)
+                last_time = t
+                trades_ts.append(t)
+                trades_qty.append(q)
+                trades_sign.append(sgn)
+
+        impact = impact_scale * kernel.dot_states(S_states)
+        noise = rng.normal(0, noise_scale)
+        new_mid = max(0.01, mid[-1] + impact + noise)
+        mid.append(new_mid)
+
+        if n_child == 0:
+            dt = (t - last_time)
+            S_states = kernel.step_update(S_states, dt, 0.0)
+            last_time = t
+
+    mid = np.array(mid)
+    bid = mid - base_spread_ticks * tick_size / 2.0
+    ask = mid + base_spread_ticks * tick_size / 2.0
+
+    activity = pd.Series(sign_series).rolling(int(1.0 / resample_dt)).mean().fillna(0).abs().values
+    bid_sz = 200 + 100 * activity + np.random.default_rng(seed+1).integers(0, 50, size=len(activity))
+    ask_sz = 200 + 100 * activity + np.random.default_rng(seed+2).integers(0, 50, size=len(activity))
+
+    for ts, sgn in zip(trades_ts, trades_sign):
+        idx = int(ts / resample_dt)
+        p = ask[idx] if sgn > 0 else bid[idx]
+        trades_price.append(p)
+
+    trades = pd.DataFrame({
+        "ts": trades_ts,
+        "price": trades_price,
+        "qty": trades_qty,
+        "aggressor": trades_sign
+    }).sort_values("ts").reset_index(drop=True)
+
+    quotes = pd.DataFrame({"ts": times_grid, "bid": bid, "ask": ask})
+    lob_top = pd.DataFrame({"ts": times_grid, "bid_sz": bid_sz, "ask_sz": ask_sz})
+    return trades, quotes, lob_top
+
+# ---------- CLI demo (if run as script) ----------
+The Subtle Interplay between Square-root Impact,
+Order Imbalance & Volatility
+def demo():
+    trades, quotes, lob_top = synthetic_l1_l2_stable(seed=11, T=3600.0, resample_dt=0.05)
+    cfg = HFAlphaConfig(a=0.5, H=60.0, resample_dt=1.0, eps=0.05, M=10, tau_min=0.1, tau_max=600.0,
+                        spread_max_ticks=2, min_top_depth=200, tick_size=0.01, fee_bps=1.0, slip_ticks=0.2)
+    engine = HFAlphaEngine(cfg)
+    stats = engine.run(trades, quotes, lob_top)
+    print('Demo stats:', stats)
+
+if __name__ == '__main__':
+    demo()
