@@ -1,0 +1,144 @@
+
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple, Dict
+import numpy as np
+import pandas as pd
+import math
+
+# --- Kernel mixture approximating 1/sqrt(t+eps) ---
+@dataclass
+class KernelMixturePowerLaw:
+    H: float = 300.0
+    eps: float = 0.05
+    M: int = 8
+    tau_min: float = 0.2
+    tau_max: float = 600.0
+    coeffs_: Optional[np.ndarray] = None
+    taus_: Optional[np.ndarray] = None
+
+    def __post_init__(self):
+        self.taus_ = np.geomspace(self.tau_min, self.tau_max, self.M)
+        t_grid = np.geomspace(self.eps, self.H, 600)
+        target = 1.0 / np.sqrt(t_grid + self.eps)
+        A = np.exp(-np.outer(t_grid, 1.0 / self.taus_))
+        ridge = 1e-8 * np.eye(self.M)
+        self.coeffs_ = np.linalg.lstsq(A.T @ A + ridge, A.T @ target, rcond=None)[0]
+
+    def step_update(self, S: np.ndarray, dt: float, inc: float) -> np.ndarray:
+        decay = np.exp(-dt / self.taus_)
+        return decay * S + inc
+
+    def value(self, S: np.ndarray) -> float:
+        return float(np.dot(self.coeffs_, S))
+
+# --- Detection (thresholded change-points on decayed signed volume) ---
+@dataclass
+class MetaorderDetectionConfig:
+    a: float = 0.5
+    kernel: KernelMixturePowerLaw = field(default_factory=lambda: KernelMixturePowerLaw(H=600.0, eps=0.05, M=10, tau_min=0.1, tau_max=600.0))
+    score_quantile: float = 0.98
+    end_quantile: float = 0.85
+    min_children: int = 5
+    min_duration: float = 5.0
+    merge_gap: float = 2.0
+    resample_dt: float = 0.25
+
+class MetaorderDetector:
+    def __init__(self, cfg: MetaorderDetectionConfig):
+        self.cfg = cfg
+
+    def detect(self, trades: pd.DataFrame) -> pd.DataFrame:
+        df = trades.copy()
+        sqa = np.sign(df["aggressor"].values) * (np.array(df["qty"].values, dtype=float) ** self.cfg.a)
+        ts = df["ts"].values.astype(float)
+        t0, t1 = ts.min(), ts.max()
+        grid = np.arange(math.floor(t0), math.ceil(t1) + self.cfg.resample_dt, self.cfg.resample_dt)
+        S = np.zeros(self.cfg.kernel.M); score = np.zeros_like(grid, dtype=float)
+        k = 0; last_t = grid[0]
+        for j, gtime in enumerate(grid):
+            S = self.cfg.kernel.step_update(S, gtime - last_t, 0.0)
+            last_t = gtime
+            while k < len(ts) and ts[k] <= gtime:
+                inc = sqa[k]; S = self.cfg.kernel.step_update(S, 0.0, inc); k += 1
+            score[j] = self.cfg.kernel.value(S)
+
+        q_hi = np.quantile(np.abs(score), self.cfg.score_quantile)
+        q_lo = np.quantile(np.abs(score), self.cfg.end_quantile)
+        segments = []; state = 0; seg_start = None
+        for j, gtime in enumerate(grid):
+            s = score[j]
+            if state == 0 and abs(s) >= q_hi:
+                state = 1 if s > 0 else -1; seg_start = gtime
+            elif state != 0 and (abs(s) < q_lo or (np.sign(s) != state and abs(s) > q_lo)):
+                segments.append((seg_start, gtime, state)); state = 0; seg_start = None
+
+        # merge
+        merged = []
+        for seg in segments:
+            if not merged: merged.append(seg)
+            else:
+                t0, t1, sgn = merged[-1]
+                if seg[0] - t1 <= self.cfg.merge_gap and sgn == seg[2]:
+                    merged[-1] = (t0, seg[1], sgn)
+                else:
+                    merged.append(seg)
+
+        out_rows = []
+        for idx, (t0, t1, sgn) in enumerate(merged):
+            mask = (df["ts"].values >= t0) & (df["ts"].values <= t1) & (np.sign(df["aggressor"].values) == sgn)
+            n = int(mask.sum()); dur = t1 - t0
+            if n >= self.cfg.min_children and dur >= self.cfg.min_duration:
+                vol = df.loc[mask, "qty"].sum()
+                out_rows.append({"meta_id": idx, "t0": float(t0), "t1": float(t1), "sign": int(sgn), "n_child": n, "vol": float(vol)})
+        return pd.DataFrame(out_rows)
+
+# --- Mapping generator (Maitrier–Loeper–Bouchaud Algorithm 1 proxy) ---
+@dataclass
+class MappingConfig:
+    n_traders: int = 20
+    p_same_trader: float = 0.05
+    p_sticky_sign: float = 0.85
+    trader_activity: str = "uniform"
+    dirichlet_alpha: float = 1.0
+
+def generate_metaorders_via_mapping(trades: pd.DataFrame, cfg: MappingConfig) -> pd.DataFrame:
+    df = trades.copy().reset_index(drop=True)
+    n = len(df)
+    rng = np.random.default_rng(17)
+    if cfg.trader_activity == "uniform":
+        weights = np.ones(cfg.n_traders) / cfg.n_traders
+    else:
+        weights = rng.dirichlet(np.ones(cfg.n_traders) * cfg.dirichlet_alpha)
+
+    trader = np.empty(n, dtype=int)
+    current_trader = rng.choice(cfg.n_traders, p=weights)
+    for i in range(n):
+        if i > 0 and rng.random() < cfg.p_same_trader:
+            pass
+        else:
+            current_trader = rng.choice(cfg.n_traders, p=weights)
+        trader[i] = current_trader
+    df["trader"] = trader
+
+    signs = np.sign(df["aggressor"].values).astype(int)
+    last_sign_by_trader = {t: 0 for t in range(cfg.n_traders)}
+    for i in range(n):
+        t = df.at[i, "trader"]; s = signs[i]; last = last_sign_by_trader[t]
+        if last == 0: last_sign_by_trader[t] = s
+        else:
+            if np.random.random() < cfg.p_sticky_sign:
+                signs[i] = last
+            else:
+                last_sign_by_trader[t] = s
+    df["sign_synth"] = signs
+
+    meta_rows = []; meta_id = 0; i = 0
+    while i < n:
+        t0 = df.at[i, "ts"]; tr = df.at[i, "trader"]; s = df.at[i, "sign_synth"]; j = i + 1
+        while j < n and df.at[j, "trader"] == tr and df.at[j, "sign_synth"] == s: j += 1
+        t1 = df.at[j-1, "ts"]; n_child = j - i; vol = df.loc[i:j-1, "qty"].sum()
+        if n_child > 1:
+            meta_rows.append({"meta_id": meta_id, "t0": float(t0), "t1": float(t1), "sign": int(s), "n_child": int(n_child), "vol": float(vol)})
+            meta_id += 1
+        i = j
+    return pd.DataFrame(meta_rows)
