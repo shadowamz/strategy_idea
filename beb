@@ -1,0 +1,516 @@
+# ts_conv_lstm_strict.py
+# ConvLSTM streaming (fenêtre=180) avec contraintes de sortie par type
+# et entraînement robuste (AMP, dropout, weight decay, clipping, cosine LR, early stopping).
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+import math
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm
+
+# Types de colonnes (features)
+# 0: BIN_POS  {0, +0.1}
+# 1: BIN_NEG  {0, -0.1}
+# 2: CONT_POS [0, +0.1]
+# 3: CONT_NEG [-0.1, 0]
+
+# ---------- utilitaires types/masques ----------
+def infer_feature_types_strict(data_sample: np.ndarray, tol: float = 1e-6) -> np.ndarray:
+    """
+    Déduit un type par feature depuis un échantillon (T_s, F) en respectant les domaines.
+    Heuristique:
+      - si valeurs ~{0, 0.1} -> BIN_POS
+      - si valeurs ~{0, -0.1} -> BIN_NEG
+      - si min>=-tol et max<=0.1+tol -> CONT_POS
+      - si max<=tol et min>=-0.1-tol -> CONT_NEG
+      - sinon: choisir cont_pos si |max| >= |min|, sinon cont_neg
+    """
+    assert data_sample.ndim == 2
+    T, F = data_sample.shape
+    types = np.zeros(F, dtype=np.int64)
+    for f in range(F):
+        col = data_sample[:, f]
+        mn = float(col.min()); mx = float(col.max())
+        uniq = np.unique(np.round(col, 6))
+        # BIN_POS ?
+        if np.all(np.isin(uniq, [0.0, 0.1])):
+            types[f] = 0; continue
+        # BIN_NEG ?
+        if np.all(np.isin(uniq, [0.0, -0.1])):
+            types[f] = 1; continue
+        # CONT_POS / CONT_NEG
+        if mn >= -tol and mx <= 0.1 + tol:
+            types[f] = 2
+        elif mx <= tol and mn >= -0.1 - tol:
+            types[f] = 3
+        else:
+            # mix → trancher par signe dominant
+            types[f] = 2 if mx >= -mn else 3
+    return types
+
+def make_type_masks(types: np.ndarray, F: int, W: int) -> np.ndarray:
+    """
+    Crée un tenseur (4, F, W) one-hot répété sur la largeur.
+    types: (F,) dans {0,1,2,3}
+    """
+    m = np.zeros((4, F, 1), dtype=np.float32)
+    for k in range(4):
+        m[k, types == k, 0] = 1.0
+    return np.repeat(m, W, axis=2)  # (4,F,W)
+
+# ---------- dataset fenêtré ----------
+@dataclass
+class WindowingConfig:
+    window: int = 180
+    stride: int = 1
+    horizon: int = 180        # fenêtre cible non chevauchante
+
+class TSConvLSTMDataset(Dataset):
+    """
+    Série (T,F) → (X, Y) où:
+      X ∈ R^{5×F×W} = [ valeur_norm (1 canal), masques (4 canaux) ]
+      Y ∈ R^{1×F×W} = valeurs réelles en [-0.1, 0.1]
+    X = [t, t+W-1], Y = [t+H, t+H+W-1]
+    """
+    def __init__(self, data: np.ndarray, types: Optional[np.ndarray], cfg: WindowingConfig):
+        assert data.ndim == 2, "data doit être (T, F)"
+        self.data = data.astype(np.float32)
+        self.cfg = cfg
+        T, F = self.data.shape
+        self.types = infer_feature_types_strict(self.data) if types is None else types.astype(np.int64)
+        assert self.types.shape[0] == F, "types doit être de longueur F"
+        W, H = cfg.window, cfg.horizon
+        self.N = max(0, T - W - H + 1)
+        if self.N <= 0:
+            raise ValueError("Pas assez de points pour au moins 1 paire.")
+        self.F = F; self.W = W
+
+    def __len__(self):
+        return (self.N + self.cfg.stride - 1) // self.cfg.stride
+
+    def __getitem__(self, idx):
+        i = idx * self.cfg.stride
+        W, H, F = self.cfg.window, self.cfg.horizon, self.F
+        x = self.data[i : i + W].T                  # (F,W)
+        y = self.data[i + H : i + H + W].T          # (F,W) valeurs réelles
+        x = np.clip(x / 0.1, -1.0, 1.0).astype(np.float32)    # normalisation [-1,1]
+        masks = make_type_masks(self.types, F, W)             # (4,F,W)
+        x_in = np.concatenate([x[None, ...], masks], axis=0)  # (5,F,W)
+        y_out = y[None, ...].astype(np.float32)               # (1,F,W) (unités réelles)
+        return torch.from_numpy(x_in), torch.from_numpy(y_out)
+
+# ---------- blocs réseau ----------
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
+        )
+    def forward(self, x): return self.net(x)
+
+class Down(nn.Module):
+    def __init__(self, in_ch, out_ch, dropout=0.1):
+        super().__init__()
+        self.conv = ConvBlock(in_ch, out_ch, dropout)
+        self.down = nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1)
+    def forward(self, x):
+        x = self.conv(x)
+        return self.down(x)
+
+class Up(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2)
+        self.conv = ConvBlock(out_ch * 2, out_ch)
+    def forward(self, x, skip):
+        x = self.up(x)
+        dh = skip.size(-2) - x.size(-2)
+        dw = skip.size(-1) - x.size(-1)
+        if dh != 0 or dw != 0:
+            x = nn.functional.pad(x, (0, dw, 0, dh))
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+class ConvLSTMCell(nn.Module):
+    def __init__(self, in_ch, hidden_ch, kernel_size=3):
+        super().__init__()
+        pad = kernel_size // 2
+        self.hidden_ch = hidden_ch
+        self.conv = nn.Conv2d(in_ch + hidden_ch, 4 * hidden_ch, kernel_size, padding=pad)
+    def forward(self, x, state: Optional[Tuple[torch.Tensor, torch.Tensor]]):
+        B, C, H, W = x.shape
+        if state is None:
+            h = torch.zeros(B, self.hidden_ch, H, W, device=x.device, dtype=x.dtype)
+            c = torch.zeros_like(h)
+        else:
+            h, c = state
+            if h.size(-2) != H or h.size(-1) != W:
+                h = nn.functional.interpolate(h, size=(H, W), mode='bilinear', align_corners=False)
+                c = nn.functional.interpolate(c, size=(H, W), mode='bilinear', align_corners=False)
+        gates = self.conv(torch.cat([x, h], dim=1))
+        i, f, g, o = torch.chunk(gates, 4, dim=1)
+        i = torch.sigmoid(i); f = torch.sigmoid(f); o = torch.sigmoid(o); g = torch.tanh(g)
+        c = f * c + i * g
+        h = o * torch.tanh(c)
+        return h, (h, c)
+
+class Encoder(nn.Module):
+    def __init__(self, in_ch=5, base=32, dropout=0.1):
+        super().__init__()
+        self.stem = ConvBlock(in_ch, base, dropout)
+        self.d1 = Down(base, base*2, dropout)
+        self.d2 = Down(base*2, base*4, dropout)
+    def forward(self, x):
+        s0 = self.stem(x)
+        s1 = self.d1(s0)
+        s2 = self.d2(s1)
+        return s0, s1, s2
+
+class Decoder(nn.Module):
+    def __init__(self, out_ch=1, base=32):
+        super().__init__()
+        self.u1 = Up(base*4, base*2)
+        self.u0 = Up(base*2, base)
+        self.head = nn.Conv2d(base, out_ch, 1)
+    def forward(self, x2, s1, s0):
+        x = self.u1(x2, s1)
+        x = self.u0(x, s0)
+        logits = self.head(x)  # logits bruts (pas de tanh)
+        return logits
+
+class ConvLSTMForecaster(nn.Module):
+    def __init__(self, in_ch=5, base=32, hidden=64, out_ch=1, dropout=0.1):
+        super().__init__()
+        self.enc = Encoder(in_ch, base, dropout)
+        self.lstm = ConvLSTMCell(base*4, hidden)
+        self.proj = nn.Conv2d(hidden, base*4, 1)
+        self.dec = Decoder(out_ch, base)
+        self._state = None
+    def forward(self, x, state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+        s0, s1, s2 = self.enc(x)
+        h, state = self.lstm(s2, state)
+        x2 = self.proj(h)
+        logits = self.dec(x2, s1, s0)  # (B,1,F,W)
+        return logits, state
+    # streaming
+    def reset_state(self): self._state = None
+    @torch.no_grad()
+    def step(self, x: torch.Tensor) -> torch.Tensor:
+        logits, self._state = self.forward(x, self._state)
+        return logits
+
+# ---------- projection & pertes (garantit les contraintes) ----------
+def project_values_from_logits(logits: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    """
+    logits: (B,1,F,W), masks: (B,4,F,W) -> valeurs (B,1,F,W) respectant les domaines.
+    """
+    sig = torch.sigmoid(logits)
+    m_bp = masks[:, 0:1]  # BIN_POS
+    m_bn = masks[:, 1:2]  # BIN_NEG
+    m_cp = masks[:, 2:3]  # CONT_POS
+    m_cn = masks[:, 3:4]  # CONT_NEG
+    y_bp = 0.1 * (sig > 0.5).float()
+    y_bn = -0.1 * (sig > 0.5).float()
+    y_cp = 0.1 * sig
+    y_cn = -0.1 * sig
+    return y_bp * m_bp + y_bn * m_bn + y_cp * m_cp + y_cn * m_cn
+
+def loss_conditional(logits: torch.Tensor, y_real: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    """
+    BCE pour binaires + Huber/L1 pour continus, le tout masqué par type.
+    """
+    bce = nn.BCEWithLogitsLoss(reduction='none')
+    huber = nn.SmoothL1Loss(reduction='none')
+    l1 = nn.L1Loss(reduction='none')
+
+    m_bp = masks[:, 0:1]
+    m_bn = masks[:, 1:2]
+    m_cp = masks[:, 2:3]
+    m_cn = masks[:, 3:4]
+
+    # labels binaires 0/1
+    y_bp_lbl = (y_real / 0.1).clamp(0, 1)
+    y_bn_lbl = (-y_real / 0.1).clamp(0, 1)
+
+    Lbp = (bce(logits, y_bp_lbl) * m_bp).sum() / m_bp.sum().clamp_min(1)
+    Lbn = (bce(logits, y_bn_lbl) * m_bn).sum() / m_bn.sum().clamp_min(1)
+
+    sig = torch.sigmoid(logits)
+    ycp = 0.1 * sig
+    ycn = -0.1 * sig
+    Lcp = ((0.7*huber(ycp, y_real) + 0.3*l1(ycp, y_real)) * m_cp).sum() / m_cp.sum().clamp_min(1)
+    Lcn = ((0.7*huber(ycn, y_real) + 0.3*l1(ycn, y_real)) * m_cn).sum() / m_cn.sum().clamp_min(1)
+
+    return Lbp + Lbn + Lcp + Lcn
+
+# ---------- entraînement fenêtres i.i.d. ----------
+def train_model(model: nn.Module,
+                train: DataLoader,
+                val: Optional[DataLoader] = None,
+                epochs: int = 20,
+                lr: float = 2e-3,
+                weight_decay: float = 1e-4,
+                grad_clip: float = 1.0,
+                early_patience: int = 8,
+                device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+    model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    total_steps = max(1, epochs * len(train))
+    warmup = max(10, total_steps // 20)
+    def lr_lambda(step):
+        if step < warmup:
+            return (step + 1) / warmup
+        t = (step - warmup) / max(1, total_steps - warmup)
+        return 0.5 * (1 + math.cos(math.pi * t))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda"))
+    best_val = float("inf"); best_state = None; since_best = 0
+
+    for ep in range(1, epochs + 1):
+        model.train(); run = 0.0; n = 0
+        pbar = tqdm(train, desc=f"Epoch {ep}/{epochs} [train]", leave=True)
+        for xb, yb in pbar:
+            xb = xb.to(device); yb = yb.to(device)
+            masks = xb[:, 1:5]  # (B,4,F,W)
+            opt.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=device.startswith("cuda")):
+                logits, _ = model(xb, None)
+                loss = loss_conditional(logits, yb, masks)
+            scaler.scale(loss).backward()
+            if grad_clip is not None:
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(opt); scaler.update(); sched.step()
+            bs = xb.size(0); run += loss.item() * bs; n += bs
+            pbar.set_postfix(loss=loss.item())
+
+        msg = f"[Epoch {ep}] train {run/max(1,n):.6f}"
+
+        if val is not None:
+            model.eval(); vtot = 0.0; vn = 0
+            with torch.no_grad():
+                for xb, yb in tqdm(val, desc=f"Epoch {ep}/{epochs} [val]", leave=False):
+                    xb = xb.to(device); yb = yb.to(device)
+                    masks = xb[:, 1:5]
+                    logits, _ = model(xb, None)
+                    vloss = loss_conditional(logits, yb, masks)
+                    bs = xb.size(0); vtot += vloss.item() * bs; vn += bs
+            vavg = vtot / max(1, vn); msg += f" | val {vavg:.6f}"
+            if vavg < best_val:
+                best_val = vavg; best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                since_best = 0
+            else:
+                since_best += 1
+        print(msg)
+        if since_best >= early_patience:
+            print(f"Early stopping (patience={early_patience})."); break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model
+
+# ---------- entraînement streaming par jour (TBPTT) ----------
+def fit_streaming_by_day(data: np.ndarray,
+                         types: np.ndarray,
+                         model: ConvLSTMForecaster,
+                         cfg: WindowingConfig,
+                         steps_per_day: int,
+                         epochs: int = 3,
+                         stride: int = 1,
+                         tbptt_steps: int = 8,
+                         lr: float = 2e-3,
+                         weight_decay: float = 1e-4,
+                         grad_clip: float = 1.0,
+                         device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+    model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda"))
+
+    T, F = data.shape
+    W, H = cfg.window, cfg.horizon
+
+    def make_pair(t_idx: int):
+        x = data[t_idx : t_idx + W].T
+        y = data[t_idx + H : t_idx + H + W].T
+        x = np.clip(x/0.1, -1.0, 1.0).astype(np.float32)
+        y = y.astype(np.float32)
+        masks = make_type_masks(types, F, W)
+        xin = np.concatenate([x[None,...], masks], axis=0)[None,...]  # (1,5,F,W)
+        yin = y[None, None, ...]                                      # (1,1,F,W)
+        return torch.from_numpy(xin), torch.from_numpy(yin)
+
+    max_start = T - W - H + 1
+    n_days = max(0, (T // steps_per_day))
+    for ep in range(1, epochs + 1):
+        model.train(); total = 0.0; nsteps = 0
+        for d in tqdm(range(n_days), desc=f"Epoch {ep}/{epochs} [days]", leave=True):
+            day_start = d * steps_per_day
+            day_end = min(day_start + steps_per_day, max_start)
+            state = None; micro = 0; accum = 0.0
+            opt.zero_grad(set_to_none=True)
+            t = day_start
+            while t < day_end:
+                xb, yb = make_pair(t)
+                xb = xb.to(device); yb = yb.to(device)
+                masks = xb[:, 1:5]
+                with torch.cuda.amp.autocast(enabled=device.startswith("cuda")):
+                    logits, state = model(xb, state)
+                    loss = loss_conditional(logits, yb, masks)
+                scaler.scale(loss).backward()
+                accum += loss.item(); micro += 1; nsteps += 1
+                if (micro % tbptt_steps) == 0:
+                    if grad_clip is not None:
+                        scaler.unscale_(opt)
+                        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
+                    if state is not None:
+                        h, c = state; state = (h.detach(), c.detach())
+                t += stride
+            if micro % tbptt_steps != 0:
+                if grad_clip is not None:
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
+            total += accum
+        print(f"[Streaming Epoch {ep}] day-avg loss: {total/max(1,n_days):.6f} over {nsteps} steps")
+    return model
+
+# ---------- inférence ----------
+@torch.no_grad()
+def predict_next_window(model: nn.Module,
+                        window_values: np.ndarray,
+                        types: np.ndarray,
+                        device: str = "cuda" if torch.cuda.is_available() else "cpu") -> np.ndarray:
+    """
+    window_values: (F,W) en unités réelles [-0.1,0.1]
+    types: (F,) {0,1,2,3}
+    """
+    F, W = window_values.shape
+    x = np.clip(window_values/0.1, -1.0, 1.0).astype(np.float32)
+    masks = make_type_masks(types, F, W)
+    xin = np.concatenate([x[None,...], masks], axis=0)[None,...]
+    xt = torch.from_numpy(xin).to(device)
+    model.eval()
+    logits, _ = model(xt, None)
+    vals = project_values_from_logits(logits, torch.from_numpy(masks[None,...]).to(device))
+    return vals.squeeze(0).squeeze(0).detach().cpu().numpy()
+
+class StreamPredictor:
+    def __init__(self, model: ConvLSTMForecaster, types: np.ndarray,
+                 device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+        self.model = model; self.types = types; self.device = device
+    def reset(self): self.model.reset_state()
+    @torch.no_grad()
+    def push(self, window_values: np.ndarray) -> np.ndarray:
+        F, W = window_values.shape
+        x = np.clip(window_values/0.1, -1.0, 1.0).astype(np.float32)
+        masks = make_type_masks(self.types, F, W)
+        xin = np.concatenate([x[None,...], masks], axis=0)[None,...]
+        xt = torch.from_numpy(xin).to(self.device)
+        logits = self.model.step(xt)
+        vals = project_values_from_logits(logits, torch.from_numpy(masks[None,...]).to(self.device))
+        return vals.squeeze(0).squeeze(0).cpu().numpy()
+
+# ---------- génération de données synthétiques pour test ----------
+def make_synthetic_data(T=6000, F_bin_pos=6, F_bin_neg=6, F_cont_pos=10, F_cont_neg=10, seed=42):
+    """
+    Data (T,F) + types (F,) respectant strictement les domaines.
+    """
+    rs = np.random.RandomState(seed)
+    blocks = []; types = []
+    # BIN_POS
+    for _ in range(F_bin_pos):
+        x = np.zeros(T, dtype=np.float32); on = rs.rand(T) < 0.05; x[on] = 0.1
+        blocks.append(x); types.append(0)
+    # BIN_NEG
+    for _ in range(F_bin_neg):
+        x = np.zeros(T, dtype=np.float32); on = rs.rand(T) < 0.05; x[on] = -0.1
+        blocks.append(x); types.append(1)
+    # CONT_POS
+    for _ in range(F_cont_pos):
+        x = np.zeros(T, dtype=np.float32); a = 0.95
+        for t in range(1, T):
+            x[t] = max(0.0, min(0.1, a * x[t-1] + 0.02 * rs.randn()))
+        blocks.append(x); types.append(2)
+    # CONT_NEG
+    for _ in range(F_cont_neg):
+        x = np.zeros(T, dtype=np.float32); a = 0.95
+        for t in range(1, T):
+            x[t] = -max(0.0, min(0.1, a * (-x[t-1]) + 0.02 * rs.randn()))
+        blocks.append(x); types.append(3)
+
+    data = np.stack(blocks, axis=1)  # (T,F)
+    types = np.array(types, dtype=np.int64)
+    # mélanger colonnes
+    perm = rs.permutation(data.shape[1])
+    data = data[:, perm]; types = types[perm]
+    return data, types
+
+# ---------- exemple d’exécution ----------
+if __name__ == "__main__":
+    # 1) Données jouet
+    data, types = make_synthetic_data(T=6000, F_bin_pos=6, F_bin_neg=6, F_cont_pos=10, F_cont_neg=10)
+    T, F = data.shape
+    print(f"Data: {data.shape} | types:", {k: int((types==k).sum()) for k in range(4)})
+
+    # 2) Config fenêtre/horizon
+    cfg = WindowingConfig(window=180, stride=2, horizon=180)
+
+    # 3) Split temporel
+    split = int(0.8 * T)
+    train_ds = TSConvLSTMDataset(data[:split], types, cfg)
+    val_ds   = TSConvLSTMDataset(data[split - (cfg.window + cfg.horizon) + 1 :], types, cfg)
+
+    train_ld = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=0, pin_memory=False)
+    val_ld   = DataLoader(val_ds,   batch_size=16, shuffle=False, num_workers=0, pin_memory=False)
+
+    # 4) Modèle compact + entraînement robuste (barres de progression incluses)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = ConvLSTMForecaster(in_ch=5, base=32, hidden=64, out_ch=1, dropout=0.1)
+    model = train_model(model, train_ld, val_ld,
+                        epochs=8, lr=2e-3, weight_decay=1e-4,
+                        grad_clip=1.0, early_patience=8, device=device)
+
+    # 5) Inférence sur la dernière fenêtre connue + contrôle des contraintes
+    last_win = data[-cfg.window:].T
+    pred_next = predict_next_window(model, last_win, types, device=device)
+
+    def check_constraints(pred: np.ndarray, types: np.ndarray):
+        ok = True; F, W = pred.shape
+        for f in range(F):
+            col = pred[f]; t = types[f]
+            if t == 0 and not np.all(np.isin(np.unique(np.round(col,6)), [0.0, 0.1])):
+                ok = False; print(f"[VIOLATION BIN_POS] f={f} uniques={np.unique(np.round(col,6))}")
+            if t == 1 and not np.all(np.isin(np.unique(np.round(col,6)), [0.0, -0.1])):
+                ok = False; print(f"[VIOLATION BIN_NEG] f={f} uniques={np.unique(np.round(col,6))}")
+            if t == 2 and (col.min() < -1e-6 or col.max() > 0.1 + 1e-6):
+                ok = False; print(f"[VIOLATION CONT_POS] f={f} min={col.min()} max={col.max()}")
+            if t == 3 and (col.min() < -0.1 - 1e-6 or col.max() > 1e-6):
+                ok = False; print(f"[VIOLATION CONT_NEG] f={f} min={col.min()} max={col.max()}")
+        return ok
+
+    print("Contraintes respectées ?", check_constraints(pred_next, types))
+
+    # 6) Entraînement streaming par jour (TBPTT) + démo
+    STEPS_PER_DAY = 288  # ex. données toutes les 5 minutes
+    model_stream = ConvLSTMForecaster(in_ch=5, base=32, hidden=64, out_ch=1, dropout=0.1)
+    model_stream = fit_streaming_by_day(data, types, model_stream, cfg,
+                                        steps_per_day=STEPS_PER_DAY,
+                                        epochs=2, stride=1, tbptt_steps=8,
+                                        lr=2e-3, weight_decay=1e-4, grad_clip=1.0,
+                                        device=device)
+    sp = StreamPredictor(model_stream, types, device=device)
+    sp.reset()
+    demo_pred = sp.push(last_win)
+    print("Streaming démo OK. Shape:", demo_pred.shape)
