@@ -1,0 +1,933 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         L2 ALPHA FEATURE ENGINE                            ║
+║              Revolutionary Order Book Feature Engineering                   ║
+║                                                                              ║
+║  Author  : Quant Research                                                   ║
+║  Target  : Equity microstructure alpha — tick-horizon prediction            ║
+║  Input   : Raw L2 snapshots (bid/ask price+size, 10 levels)                 ║
+║  Output  : Multi-layer uncorrelated feature matrix                          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+ARCHITECTURE
+============
+Layer 0 — Normalization          (cross-stock, cross-regime comparable)
+Layer 1 — Static Book Shape      (slope, curvature, gravity, VWAP impact)
+Layer 2 — Dynamic Evolution      (velocity, acceleration, level migration)
+Layer 3 — Hidden Structure       (book divergence, latent PCA factors,
+                                   informed flow proxies, iceberg detection)
+Layer 4 — Rolling Multi-Scale    (aggregate everything at N time scales)
+Layer 5 — Target Engineering     (tick-horizon, spread-normalized returns)
+"""
+
+import numpy as np
+import pandas as pd
+from numpy.polynomial import polynomial as P
+from sklearn.decomposition import PCA, FastICA
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import entropy as scipy_entropy
+from scipy.signal import find_peaks
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+LEVELS = 10
+EPS    = 1e-10
+
+# Rolling window sizes (in ticks) — multi-scale pyramid
+WINDOWS = [5, 10, 30, 50, 100, 200, 500, 1000]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 0 — DATA INGESTION & NORMALIZATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_l2_snapshot(df: pd.DataFrame) -> dict:
+    """
+    Parse a DataFrame of L2 snapshots into structured arrays.
+
+    Expected columns:
+        bid_price_1 .. bid_price_10
+        bid_size_1  .. bid_size_10
+        ask_price_1 .. ask_price_10
+        ask_size_1  .. ask_size_10
+
+    Returns a dict of arrays shaped (T, 10).
+    """
+    T = len(df)
+    data = {}
+    for side in ["bid", "ask"]:
+        for field in ["price", "size"]:
+            arr = np.zeros((T, LEVELS))
+            for k in range(LEVELS):
+                col = f"{side}_{field}_{k+1}"
+                arr[:, k] = df[col].values
+            data[f"{side}_{field}"] = arr  # shape (T, 10)
+    return data
+
+
+def normalize_book(data: dict) -> dict:
+    """
+    Normalize everything to spread units and total book notional.
+    Makes features stationary and cross-stock comparable.
+
+    Adds to data dict:
+        mid          (T,)     mid price
+        spread       (T,)     bid-ask spread
+        rel_spread   (T,)     spread / mid
+        bid_notional (T, 10)  bid_price_k * bid_size_k
+        ask_notional (T, 10)  ask_price_k * ask_size_k
+        total_notional (T,)   sum of all 20 notionals
+        bid_price_norm (T, 10) price distance from mid in spread units
+        ask_price_norm (T, 10)
+        bid_size_norm  (T, 10) notional share of total book
+        ask_size_norm  (T, 10)
+    """
+    bp = data["bid_price"]
+    bs = data["bid_size"]
+    ap = data["ask_price"]
+    as_ = data["ask_size"]
+
+    mid    = (bp[:, 0] + ap[:, 0]) / 2          # (T,)
+    spread = ap[:, 0] - bp[:, 0]                 # (T,)
+    spread = np.where(spread < EPS, EPS, spread)
+
+    bid_notional = bp * bs                        # (T, 10)
+    ask_notional = ap * as_                       # (T, 10)
+    total_notional = (
+        bid_notional.sum(axis=1) + ask_notional.sum(axis=1)
+    )[:, None]                                    # (T, 1)
+    total_notional = np.where(total_notional < EPS, EPS, total_notional)
+
+    # Price normalized to spread units (distance from mid)
+    bid_price_norm = (bp - mid[:, None]) / spread[:, None]
+    ask_price_norm = (ap - mid[:, None]) / spread[:, None]
+
+    # Size normalized to total book notional share
+    bid_size_norm  = bid_notional / total_notional
+    ask_size_norm  = ask_notional / total_notional
+
+    data.update({
+        "mid"            : mid,
+        "spread"         : spread,
+        "rel_spread"     : spread / (mid + EPS),
+        "bid_notional"   : bid_notional,
+        "ask_notional"   : ask_notional,
+        "total_notional" : total_notional.squeeze(),
+        "bid_price_norm" : bid_price_norm,
+        "ask_price_norm" : ask_price_norm,
+        "bid_size_norm"  : bid_size_norm,
+        "ask_size_norm"  : ask_size_norm,
+    })
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 1 — STATIC BOOK SHAPE FEATURES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_static_features(data: dict) -> pd.DataFrame:
+    """
+    Extract static shape features from each snapshot independently.
+
+    Features:
+        imbalance_L{k}         — signed imbalance at cumulative depth k
+        surface_vs_deep        — L1 imbalance vs L5 imbalance
+        bid_slope / ask_slope  — linear fit to depth profile
+        slope_asymmetry        — bid slope - ask slope
+        bid_curvature / ask_curvature — convexity of depth profile
+        curvature_signal       — bid_curv - ask_curv
+        bid_gravity / ask_gravity — depth-weighted center of mass
+        gravity_signal         — structural bullish/bearish lean
+        vwap_impact_asymmetry  — cost to buy vs sell same notional
+        spread                 — normalized spread
+        rel_spread             — spread / mid
+    """
+    T     = len(data["mid"])
+    bn    = data["bid_notional"]    # (T, 10)
+    an    = data["ask_notional"]    # (T, 10)
+    levels = np.arange(1, LEVELS + 1, dtype=float)
+    feats  = {}
+
+    # ── Cumulative imbalances at multiple depths ──────────────────────────────
+    for k in [1, 2, 3, 5, 7, 10]:
+        cum_bid = bn[:, :k].sum(axis=1)
+        cum_ask = an[:, :k].sum(axis=1)
+        feats[f"imbalance_L{k}"] = (
+            (cum_bid - cum_ask) / (cum_bid + cum_ask + EPS)
+        )
+
+    feats["surface_vs_deep"] = feats["imbalance_L1"] - feats["imbalance_L5"]
+    feats["shallow_vs_full"] = feats["imbalance_L3"] - feats["imbalance_L10"]
+
+    # ── Book slope (linear decay of liquidity) ────────────────────────────────
+    bid_slope    = np.zeros(T)
+    ask_slope    = np.zeros(T)
+    bid_curv     = np.zeros(T)
+    ask_curv     = np.zeros(T)
+    bid_gravity  = np.zeros(T)
+    ask_gravity  = np.zeros(T)
+
+    for t in range(T):
+        b = bn[t]  # (10,)
+        a = an[t]  # (10,)
+
+        # Linear slope
+        if b.sum() > EPS:
+            bid_slope[t] = np.polyfit(levels, b / (b.sum() + EPS), 1)[0]
+        if a.sum() > EPS:
+            ask_slope[t] = np.polyfit(levels, a / (a.sum() + EPS), 1)[0]
+
+        # Quadratic curvature (second-order coefficient)
+        if b.sum() > EPS:
+            bid_curv[t] = np.polyfit(levels, b / (b.sum() + EPS), 2)[0]
+        if a.sum() > EPS:
+            ask_curv[t] = np.polyfit(levels, a / (a.sum() + EPS), 2)[0]
+
+        # Gravity center (depth-weighted mean level)
+        bid_gravity[t] = np.dot(levels, b) / (b.sum() + EPS)
+        ask_gravity[t] = np.dot(levels, a) / (a.sum() + EPS)
+
+    feats["bid_slope"]         = bid_slope
+    feats["ask_slope"]         = ask_slope
+    feats["slope_asymmetry"]   = bid_slope - ask_slope
+    feats["bid_curvature"]     = bid_curv
+    feats["ask_curvature"]     = ask_curv
+    feats["curvature_signal"]  = bid_curv - ask_curv
+    feats["bid_gravity"]       = bid_gravity
+    feats["ask_gravity"]       = ask_gravity
+    # Positive = ask mass far, bid mass close = bullish structure
+    feats["gravity_signal"]    = ask_gravity - bid_gravity
+
+    # ── VWAP impact asymmetry ─────────────────────────────────────────────────
+    bp   = data["bid_price"]
+    bs   = data["bid_size"]
+    ap   = data["ask_price"]
+    as_  = data["ask_size"]
+    mid  = data["mid"]
+    # Target = 10% of average total notional across entire dataset
+    target_notional = float(np.median(data["total_notional"])) * 0.10
+
+    ask_impact_arr = np.zeros(T)
+    bid_impact_arr = np.zeros(T)
+
+    for t in range(T):
+        ask_impact_arr[t] = _vwap_impact(
+            ap[t], as_[t], target_notional
+        )
+        bid_impact_arr[t] = _vwap_impact(
+            bp[t][::-1], bs[t][::-1], target_notional
+        )
+
+    # Normalized to mid — positive = cheaper to sell (bearish pressure)
+    feats["vwap_ask_impact"] = (ask_impact_arr - mid) / (mid + EPS)
+    feats["vwap_bid_impact"] = (mid - bid_impact_arr) / (mid + EPS)
+    feats["vwap_impact_asymmetry"] = (
+        feats["vwap_ask_impact"] - feats["vwap_bid_impact"]
+    )
+
+    feats["spread"]     = data["spread"]
+    feats["rel_spread"] = data["rel_spread"]
+
+    return pd.DataFrame(feats)
+
+
+def _vwap_impact(prices, sizes, target_notional):
+    """Sweep the book to compute VWAP for a given target notional."""
+    filled = 0.0
+    cost   = 0.0
+    for p, s in zip(prices, sizes):
+        notional = p * s
+        if filled + notional >= target_notional:
+            remaining = target_notional - filled
+            cost  += remaining * p
+            filled = target_notional
+            break
+        cost  += notional
+        filled += notional
+    if filled < EPS:
+        return prices[0]
+    return cost / filled
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 2 — DYNAMIC EVOLUTION FEATURES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_dynamic_features(data: dict, static_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Features derived from CHANGES between consecutive snapshots.
+
+    Features:
+        net_flow_bid/ask       — notional added/removed per tick
+        net_flow_signed        — bid minus ask net flow
+        mid_return             — tick-by-tick mid price return
+        spread_velocity        — change in spread
+        imbalance_velocity_L{k}— rate of change of imbalance
+        imbalance_accel_L{k}   — acceleration of imbalance
+        level_stability_bid/ask— fraction of levels unchanged
+        l1_flip                — did best bid/ask price change?
+        book_migration_speed   — how fast are price levels shifting
+        depth_momentum         — is depth building or draining
+    """
+    feats = {}
+    bn    = data["bid_notional"]   # (T, 10)
+    an    = data["ask_notional"]   # (T, 10)
+    bp    = data["bid_price"]
+    ap    = data["ask_price"]
+    mid   = data["mid"]
+    sprd  = data["spread"]
+
+    # ── Net notional flow ─────────────────────────────────────────────────────
+    delta_bid = np.diff(bn, axis=0, prepend=bn[:1])  # (T, 10)
+    delta_ask = np.diff(an, axis=0, prepend=an[:1])
+
+    feats["net_flow_bid"]    = delta_bid.sum(axis=1)
+    feats["net_flow_ask"]    = delta_ask.sum(axis=1)
+    feats["net_flow_signed"] = feats["net_flow_bid"] - feats["net_flow_ask"]
+
+    # ── Mid return ────────────────────────────────────────────────────────────
+    feats["mid_return"]  = np.diff(mid, prepend=mid[0]) / (mid + EPS)
+    feats["mid_return_spread_normalized"] = (
+        np.diff(mid, prepend=mid[0]) / (sprd + EPS)
+    )
+
+    # ── Spread velocity ───────────────────────────────────────────────────────
+    feats["spread_velocity"]  = np.diff(sprd, prepend=sprd[0])
+    feats["spread_accel"]     = np.diff(
+        feats["spread_velocity"], prepend=feats["spread_velocity"][0]
+    )
+
+    # ── Imbalance velocity & acceleration ─────────────────────────────────────
+    for k in [1, 3, 5, 10]:
+        col   = f"imbalance_L{k}"
+        imb   = static_df[col].values
+        vel   = np.diff(imb, prepend=imb[0])
+        accel = np.diff(vel, prepend=vel[0])
+        feats[f"imbalance_velocity_L{k}"] = vel
+        feats[f"imbalance_accel_L{k}"]    = accel
+
+    # ── Level stability (price level unchanged = stable book) ─────────────────
+    bid_stable = (bp == np.roll(bp, 1, axis=0)).astype(float)
+    ask_stable = (ap == np.roll(ap, 1, axis=0)).astype(float)
+    bid_stable[0] = 1.0
+    ask_stable[0] = 1.0
+
+    feats["level_stability_bid"] = bid_stable.mean(axis=1)
+    feats["level_stability_ask"] = ask_stable.mean(axis=1)
+    feats["level_stability"]     = (
+        feats["level_stability_bid"] + feats["level_stability_ask"]
+    ) / 2
+
+    # ── L1 price flip ─────────────────────────────────────────────────────────
+    feats["l1_bid_flip"] = (
+        (bp[:, 0] != np.roll(bp[:, 0], 1)).astype(float)
+    )
+    feats["l1_ask_flip"] = (
+        (ap[:, 0] != np.roll(ap[:, 0], 1)).astype(float)
+    )
+    feats["l1_bid_flip"][0] = 0
+    feats["l1_ask_flip"][0] = 0
+
+    # ── Book migration speed (how fast price levels drift) ────────────────────
+    bid_mid_price = bp.mean(axis=1)
+    ask_mid_price = ap.mean(axis=1)
+    feats["book_migration_speed"] = np.abs(
+        np.diff(bid_mid_price, prepend=bid_mid_price[0])
+        + np.diff(ask_mid_price, prepend=ask_mid_price[0])
+    ) / (sprd + EPS)
+
+    # ── Depth momentum (is total book notional growing or shrinking?) ─────────
+    total = data["total_notional"]
+    feats["depth_momentum"] = np.diff(total, prepend=total[0]) / (total + EPS)
+
+    return pd.DataFrame(feats)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 3 — HIDDEN STRUCTURE FEATURES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_hidden_structure_features(
+    data: dict,
+    static_df: pd.DataFrame,
+    pca_window: int = 200,
+    n_components: int = 8
+) -> pd.DataFrame:
+    """
+    Decode the latent game between agents from raw book snapshots.
+
+    Features:
+        book_divergence        — shallow vs deep book disagreement
+        iceberg_score          — hidden refresh liquidity detection
+        stealth_accumulation   — quiet accumulation signal
+        realized_spread_proxy  — persistence of price moves
+        toxicity               — one-sidedness of flow (PIN-inspired)
+        flow_entropy           — order flow randomness
+        surprise_score         — divergence from recent norm
+        book_self_similarity   — fractal consistency across depth
+        pca_factor_{1..N}      — latent book factors (rolling PCA)
+        mm_inventory_pressure  — market maker offside proxy
+        queue_aggression       — fraction of imbalance that is improving
+    """
+    feats = {}
+    T     = len(data["mid"])
+    bn    = data["bid_notional"]
+    an    = data["ask_notional"]
+    bp    = data["bid_price"]
+    ap    = data["ask_price"]
+    bs    = data["bid_size"]
+    as_   = data["ask_size"]
+    mid   = data["mid"]
+    sprd  = data["spread"]
+
+    # ── Book divergence ───────────────────────────────────────────────────────
+    # Does the near book agree with the deep book?
+    near_bid  = bn[:, :3].sum(axis=1)
+    near_ask  = an[:, :3].sum(axis=1)
+    deep_bid  = bn[:, 3:].sum(axis=1)
+    deep_ask  = an[:, 3:].sum(axis=1)
+
+    near_imb  = (near_bid - near_ask) / (near_bid + near_ask + EPS)
+    deep_imb  = (deep_bid - deep_ask) / (deep_bid + deep_ask + EPS)
+
+    feats["book_divergence"] = near_imb - deep_imb
+    # Large = near book is painted; deep book tells opposite story
+
+    # ── Iceberg detection ─────────────────────────────────────────────────────
+    # L1 size is suspiciously stable despite book changing
+    # Proxy: absolute change in L1 size relative to change in L2-L10
+    l1_change   = np.abs(np.diff(bs[:, 0], prepend=bs[0, 0]))
+    deep_change = np.abs(np.diff(bs[:, 1:].sum(axis=1),
+                                  prepend=bs[0, 1:].sum()))
+
+    # Low L1 change relative to deep change = iceberg refreshing
+    feats["iceberg_bid"] = 1 - (
+        l1_change / (deep_change + l1_change + EPS)
+    )
+
+    l1_change_ask   = np.abs(np.diff(as_[:, 0], prepend=as_[0, 0]))
+    deep_change_ask = np.abs(np.diff(as_[:, 1:].sum(axis=1),
+                                      prepend=as_[0, 1:].sum()))
+    feats["iceberg_ask"] = 1 - (
+        l1_change_ask / (deep_change_ask + l1_change_ask + EPS)
+    )
+    feats["iceberg_net"] = feats["iceberg_bid"] - feats["iceberg_ask"]
+
+    # ── Realized spread proxy ─────────────────────────────────────────────────
+    # Did the mid move persist or revert? (without trade data)
+    mid_ret   = np.diff(mid, prepend=mid[0]) / (sprd + EPS)
+    mid_ret_5 = np.roll(mid_ret, -5)   # 5-tick forward return
+    mid_ret_5[-5:] = 0
+
+    feats["realized_spread_proxy"] = mid_ret * mid_ret_5
+    # Positive = persistent move (informed)
+    # Negative = reverting move (noise)
+
+    # ── Toxicity (PIN-inspired instantaneous) ─────────────────────────────────
+    # Asymmetry of net flow between bid and ask side
+    net_bid = np.diff(bn.sum(axis=1), prepend=bn[0].sum())
+    net_ask = np.diff(an.sum(axis=1), prepend=an[0].sum())
+    # Use only draining side (negative delta = consumption)
+    consumed_bid = np.clip(-net_bid, 0, None)
+    consumed_ask = np.clip(-net_ask, 0, None)
+
+    total_consumed = consumed_bid + consumed_ask + EPS
+    feats["toxicity"] = np.abs(consumed_bid - consumed_ask) / total_consumed
+
+    # ── Flow entropy ──────────────────────────────────────────────────────────
+    # Entropy of the distribution of notional changes across 10 levels
+    delta_bn = np.abs(np.diff(bn, axis=0, prepend=bn[:1]))
+    delta_an = np.abs(np.diff(an, axis=0, prepend=an[:1]))
+    delta_all = np.concatenate([delta_bn, delta_an], axis=1)  # (T, 20)
+
+    flow_entropy = np.zeros(T)
+    for t in range(T):
+        d = delta_all[t]
+        total = d.sum()
+        if total > EPS:
+            p = d / total
+            flow_entropy[t] = scipy_entropy(p + EPS)
+
+    feats["flow_entropy"] = flow_entropy
+    # Low entropy = structured, concentrated activity = informed
+
+    # ── Surprise score (chi-squared divergence from EWMA baseline) ────────────
+    ewma_delta = pd.DataFrame(delta_all).ewm(span=50).mean().values
+    surprise   = np.zeros(T)
+    for t in range(50, T):
+        diff    = delta_all[t] - ewma_delta[t]
+        denom   = ewma_delta[t] + EPS
+        surprise[t] = (diff ** 2 / denom).sum()
+
+    feats["surprise_score"] = surprise
+
+    # ── Book self-similarity (fractal structure) ──────────────────────────────
+    # Correlate L1-L5 depth profile with L6-L10 depth profile
+    self_sim = np.zeros(T)
+    for t in range(T):
+        b_near = bn[t, :5]
+        b_deep = bn[t, 5:]
+        if b_near.std() > EPS and b_deep.std() > EPS:
+            self_sim[t] = np.corrcoef(b_near, b_deep)[0, 1]
+
+    feats["book_self_similarity"] = self_sim
+    # Low = book is structurally inconsistent = something unusual
+
+    # ── MM inventory pressure proxy ───────────────────────────────────────────
+    # Cumulative imbalance of flow: MMs must eventually reprice
+    net_flow = net_bid - net_ask
+    feats["mm_inventory_pressure"] = (
+        pd.Series(net_flow).ewm(span=100).mean().values
+    )
+
+    # ── Rolling PCA latent factors ────────────────────────────────────────────
+    book_vectors = np.concatenate([
+        data["bid_size_norm"],
+        data["ask_size_norm"],
+        data["bid_price_norm"],
+        data["ask_price_norm"],
+    ], axis=1)  # (T, 40)
+
+    pca_factors = np.zeros((T, n_components))
+
+    for t in range(pca_window, T):
+        window = book_vectors[t - pca_window:t]
+        try:
+            scaler = StandardScaler()
+            window_scaled = scaler.fit_transform(window)
+            pca = PCA(n_components=n_components)
+            transformed = pca.fit_transform(window_scaled)
+            pca_factors[t] = transformed[-1]
+        except Exception:
+            pca_factors[t] = pca_factors[t - 1]
+
+    for i in range(n_components):
+        feats[f"pca_factor_{i+1}"] = pca_factors[:, i]
+
+    # ── Queue aggression ──────────────────────────────────────────────────────
+    # How often does the best price improve vs just add?
+    bid_l1_improve = np.maximum(
+        np.diff(bp[:, 0], prepend=bp[0, 0]), 0
+    )  # bid price went UP = improve
+    ask_l1_improve = np.maximum(
+        -np.diff(ap[:, 0], prepend=ap[0, 0]), 0
+    )  # ask price went DOWN = improve
+
+    bid_l1_improve_notional = bid_l1_improve * bs[:, 0]
+    ask_l1_improve_notional = ask_l1_improve * as_[:, 0]
+
+    feats["queue_aggression_bid"] = bid_l1_improve_notional
+    feats["queue_aggression_ask"] = ask_l1_improve_notional
+    feats["queue_aggression_net"] = (
+        bid_l1_improve_notional - ask_l1_improve_notional
+    )
+
+    return pd.DataFrame(feats)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 4 — ROLLING MULTI-SCALE AGGREGATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_rolling_features(
+    feature_df: pd.DataFrame,
+    windows: list = WINDOWS
+) -> pd.DataFrame:
+    """
+    Aggregate all features across multiple time-scale windows.
+    For each feature × window, compute: mean, std, skew, slope (trend).
+
+    This creates the time-scale pyramid that allows the model to find
+    signal at the right frequency without hardcoding it.
+    """
+    all_rolling = [feature_df.copy()]
+
+    for w in windows:
+        roll = feature_df.rolling(w, min_periods=max(1, w // 2))
+
+        mean_df  = roll.mean().add_suffix(f"_mean_{w}")
+        std_df   = roll.std().add_suffix(f"_std_{w}")
+        skew_df  = roll.skew().add_suffix(f"_skew_{w}")
+
+        # Trend: slope of feature over window (linear fit coefficient)
+        def rolling_slope(series, w):
+            x = np.arange(w, dtype=float)
+            x -= x.mean()
+            result = np.full(len(series), np.nan)
+            arr = series.values
+            for i in range(w - 1, len(arr)):
+                y = arr[i - w + 1:i + 1]
+                if not np.any(np.isnan(y)):
+                    result[i] = np.dot(x, y) / (np.dot(x, x) + EPS)
+            return result
+
+        # Only compute slope for key features (expensive)
+        key_features = [
+            "imbalance_L1", "imbalance_L5", "net_flow_signed",
+            "toxicity", "mm_inventory_pressure", "book_divergence"
+        ]
+        slope_data = {}
+        for col in key_features:
+            if col in feature_df.columns:
+                slope_data[f"{col}_slope_{w}"] = rolling_slope(
+                    feature_df[col], w
+                )
+
+        all_rolling.append(mean_df)
+        all_rolling.append(std_df)
+        all_rolling.append(skew_df)
+        if slope_data:
+            all_rolling.append(pd.DataFrame(slope_data, index=feature_df.index))
+
+    return pd.concat(all_rolling, axis=1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 5 — TARGET VARIABLE ENGINEERING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_targets(data: dict, horizons: list = [10, 30, 100, 500, 1000]) -> pd.DataFrame:
+    """
+    Build multiple prediction targets at different tick horizons.
+
+    Targets:
+        ret_N          — raw mid return over N ticks
+        ret_spread_N   — mid return normalized by spread (most stationary)
+        direction_N    — sign of return (classification target)
+        vol_N          — realized volatility over next N ticks
+    """
+    mid  = data["mid"]
+    sprd = data["spread"]
+    T    = len(mid)
+    targets = {}
+
+    for N in horizons:
+        future_mid      = np.roll(mid, -N)
+        future_mid[-N:] = np.nan
+
+        ret   = (future_mid - mid) / (mid + EPS)
+        ret_s = (future_mid - mid) / (sprd + EPS)
+
+        targets[f"ret_{N}"]          = ret
+        targets[f"ret_spread_{N}"]   = ret_s
+        targets[f"direction_{N}"]    = np.sign(ret)
+
+        # Realized vol over next N ticks
+        tick_ret    = np.diff(mid, prepend=mid[0]) / (mid + EPS)
+        vol         = np.zeros(T)
+        for t in range(T - N):
+            vol[t] = tick_ret[t:t + N].std()
+        vol[-N:] = np.nan
+        targets[f"vol_{N}"] = vol
+
+    return pd.DataFrame(targets)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MASTER PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_feature_matrix(
+    df: pd.DataFrame,
+    pca_window: int    = 200,
+    n_pca_components: int = 8,
+    rolling_windows: list = WINDOWS,
+    target_horizons: list = [10, 30, 100, 500, 1000],
+    include_rolling: bool = True,
+) -> dict:
+    """
+    MASTER PIPELINE — transforms raw L2 snapshots into full feature matrix.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw L2 snapshot dataframe with columns:
+        bid_price_1..10, bid_size_1..10, ask_price_1..10, ask_size_1..10
+
+    pca_window : int
+        Rolling window size for PCA latent factor computation (default 200)
+
+    n_pca_components : int
+        Number of latent book factors to extract (default 8)
+
+    rolling_windows : list
+        Tick windows for multi-scale aggregation
+
+    target_horizons : list
+        Tick horizons for target variable construction
+
+    include_rolling : bool
+        Whether to include multi-scale rolling features (large output)
+
+    Returns
+    -------
+    dict with keys:
+        'features'  : pd.DataFrame — full feature matrix (aligned with input)
+        'targets'   : pd.DataFrame — target variables
+        'data'      : dict         — normalized book arrays for inspection
+        'feature_groups' : dict    — maps layer name → list of column names
+    """
+    print("═" * 60)
+    print("  L2 ALPHA FEATURE ENGINE")
+    print("═" * 60)
+
+    print("\n[0] Ingesting & normalizing book data...")
+    data = load_l2_snapshot(df)
+    data = normalize_book(data)
+
+    print("[1] Computing static book shape features...")
+    static_df = compute_static_features(data)
+
+    print("[2] Computing dynamic evolution features...")
+    dynamic_df = compute_dynamic_features(data, static_df)
+
+    print("[3] Computing hidden structure features...")
+    hidden_df = compute_hidden_structure_features(
+        data, static_df, pca_window=pca_window, n_components=n_pca_components
+    )
+
+    # Combine all layers
+    base_features = pd.concat([static_df, dynamic_df, hidden_df], axis=1)
+    base_features.index = df.index
+
+    feature_groups = {
+        "static"  : list(static_df.columns),
+        "dynamic" : list(dynamic_df.columns),
+        "hidden"  : list(hidden_df.columns),
+    }
+
+    if include_rolling:
+        print("[4] Computing rolling multi-scale aggregations...")
+        all_features = compute_rolling_features(base_features, rolling_windows)
+        feature_groups["rolling"] = [
+            c for c in all_features.columns if c not in base_features.columns
+        ]
+    else:
+        all_features = base_features
+
+    print("[5] Computing target variables...")
+    targets = compute_targets(data, target_horizons)
+    targets.index = df.index
+
+    # ── Final cleanup ─────────────────────────────────────────────────────────
+    all_features = all_features.replace([np.inf, -np.inf], np.nan)
+    targets      = targets.replace([np.inf, -np.inf], np.nan)
+
+    n_features = all_features.shape[1]
+    n_targets  = targets.shape[1]
+    print(f"\n✓ Feature matrix : {len(df)} rows × {n_features} features")
+    print(f"✓ Target matrix  : {len(df)} rows × {n_targets} targets")
+    print("═" * 60)
+
+    return {
+        "features"       : all_features,
+        "targets"        : targets,
+        "data"           : data,
+        "feature_groups" : feature_groups,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FEATURE ANALYSIS UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def feature_correlation_report(features: pd.DataFrame, max_features: int = 50) -> pd.DataFrame:
+    """
+    Compute pairwise correlation matrix for top features.
+    Helps identify redundant features before model training.
+    """
+    sample = features.dropna().iloc[:, :max_features]
+    return sample.corr()
+
+
+def feature_ic_report(
+    features: pd.DataFrame,
+    targets: pd.DataFrame,
+    target_col: str = "ret_spread_100"
+) -> pd.DataFrame:
+    """
+    Compute Information Coefficient (rank correlation) between each feature
+    and the target variable. This is the standard quant way to evaluate
+    predictive power without a model.
+    """
+    from scipy.stats import spearmanr
+
+    target = targets[target_col].dropna()
+    common_idx = features.index.intersection(target.index)
+    f = features.loc[common_idx].dropna()
+    t = target.loc[f.index]
+
+    ic_data = []
+    for col in f.columns:
+        series = f[col]
+        valid  = series.notna() & t.notna()
+        if valid.sum() < 30:
+            continue
+        ic, pval = spearmanr(series[valid], t[valid])
+        ic_data.append({
+            "feature"  : col,
+            "IC"       : round(ic, 4),
+            "|IC|"     : round(abs(ic), 4),
+            "p_value"  : round(pval, 4),
+            "significant": pval < 0.05
+        })
+
+    ic_df = pd.DataFrame(ic_data).sort_values("|IC|", ascending=False)
+    return ic_df
+
+
+def get_clean_feature_set(
+    features: pd.DataFrame,
+    targets: pd.DataFrame,
+    target_col: str = "ret_spread_100",
+    max_correlation: float = 0.85,
+    min_ic: float = 0.01
+) -> pd.DataFrame:
+    """
+    Return a de-correlated, IC-filtered feature set ready for model training.
+
+    Steps:
+    1. Filter features with |IC| > min_ic vs target
+    2. Greedily remove features with pairwise correlation > max_correlation
+    3. Return clean feature matrix
+    """
+    # Step 1: IC filter
+    ic_report = feature_ic_report(features, targets, target_col)
+    good_features = ic_report[
+        ic_report["significant"] & (ic_report["|IC|"] >= min_ic)
+    ]["feature"].tolist()
+
+    if not good_features:
+        print("Warning: no features passed IC filter. Returning all features.")
+        return features
+
+    f = features[good_features].dropna()
+
+    # Step 2: greedy decorrelation
+    corr  = f.corr().abs()
+    cols  = list(f.columns)
+    keep  = []
+    dropped = set()
+
+    for col in cols:
+        if col in dropped:
+            continue
+        keep.append(col)
+        for other in cols:
+            if other != col and other not in dropped:
+                if corr.loc[col, other] > max_correlation:
+                    dropped.add(other)
+
+    print(f"✓ Clean feature set: {len(keep)} features "
+          f"(from {len(good_features)} IC-passing, {len(cols)} total)")
+    return f[keep]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SYNTHETIC DATA GENERATOR (for testing without real data)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_synthetic_l2(
+    n_ticks: int    = 5000,
+    base_price: float = 100.0,
+    tick_size: float  = 0.01,
+    seed: int        = 42
+) -> pd.DataFrame:
+    """
+    Generate realistic synthetic L2 order book data for testing.
+    Simulates a simple market with mean-reverting spread and drifting price.
+    """
+    np.random.seed(seed)
+    T = n_ticks
+
+    # Simulate mid price as random walk
+    returns = np.random.normal(0, 0.0002, T)
+    mid     = base_price * np.exp(np.cumsum(returns))
+
+    # Simulate spread (mean reverting)
+    spread  = np.abs(np.random.normal(0.05, 0.01, T))
+    spread  = np.clip(spread, tick_size, 0.20)
+
+    records = []
+    for t in range(T):
+        m = mid[t]
+        s = spread[t]
+        row = {}
+
+        # Generate 10 bid levels
+        for k in range(1, LEVELS + 1):
+            price = m - s / 2 - (k - 1) * tick_size * (1 + np.random.exponential(0.5))
+            size  = max(1, int(np.random.exponential(500) / k))
+            row[f"bid_price_{k}"] = round(price, 4)
+            row[f"bid_size_{k}"]  = size
+
+        # Generate 10 ask levels
+        for k in range(1, LEVELS + 1):
+            price = m + s / 2 + (k - 1) * tick_size * (1 + np.random.exponential(0.5))
+            size  = max(1, int(np.random.exponential(500) / k))
+            row[f"ask_price_{k}"] = round(price, 4)
+            row[f"ask_size_{k}"]  = size
+
+        records.append(row)
+
+    df = pd.DataFrame(records)
+    df.index = pd.RangeIndex(T)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUICK START EXAMPLE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+
+    print("\n" + "═" * 60)
+    print("  QUICK START — Synthetic L2 Data Demo")
+    print("═" * 60)
+
+    # 1. Generate or load your L2 data
+    print("\nGenerating synthetic L2 data (5000 ticks)...")
+    df = generate_synthetic_l2(n_ticks=5000)
+    print(f"Input shape: {df.shape}")
+
+    # 2. Run the full pipeline
+    result = build_feature_matrix(
+        df,
+        pca_window       = 200,
+        n_pca_components = 8,
+        rolling_windows  = [10, 50, 100, 500],   # subset for speed
+        target_horizons  = [10, 100, 500],
+        include_rolling  = True,
+    )
+
+    features = result["features"]
+    targets  = result["targets"]
+
+    # 3. Compute IC report
+    print("\n── Top 15 Features by |IC| vs ret_spread_100 ──")
+    ic = feature_ic_report(features, targets, target_col="ret_spread_100")
+    print(ic.head(15).to_string(index=False))
+
+    # 4. Get clean decorrelated feature set
+    print("\n── Clean Feature Set ──")
+    clean = get_clean_feature_set(
+        features, targets,
+        target_col      = "ret_spread_100",
+        max_correlation = 0.85,
+        min_ic          = 0.005
+    )
+    print(f"Clean features shape: {clean.shape}")
+    print("\nDone. Features ready for model training.")
+
+    # 5. Example: plug into any sklearn model
+    # from sklearn.ensemble import GradientBoostingClassifier
+    # target = targets["direction_100"].dropna()
+    # X = clean.loc[target.index].dropna()
+    # y = target.loc[X.index]
+    # model = GradientBoostingClassifier()
+    # model.fit(X, y)
