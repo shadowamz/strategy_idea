@@ -1,0 +1,123 @@
+import numpy as np
+import pandas as pd
+
+dict_res = {
+    "time": [], "slope_bid": [], "slope_ask": [],
+    "change_ask": [], "change_bid": [],
+    "variance_ask": [], "variance_bid": []
+}
+
+# ── Pre-round all price columns once ─────────────────────────────────────────
+ask_price_cols = [f'askPrice{k}' for k in range(1, 11)]
+ask_size_cols  = [f'askSize{k}'  for k in range(1, 11)]
+bid_price_cols = [f'bidPrice{k}' for k in range(1, 11)]
+bid_size_cols  = [f'bidSize{k}'  for k in range(1, 11)]
+
+df[ask_price_cols] = df[ask_price_cols].round(2)
+df[bid_price_cols] = df[bid_price_cols].round(2)
+
+first_time = df.iloc[0]['time']
+end_time   = df.iloc[-1]['time']
+
+while end_time > first_time:
+    window_end = first_time + pd.Timedelta(minutes=10)
+
+    snap_df = df[
+        (df['time'] >= first_time) &
+        (df['time'] <= window_end)
+    ].reset_index(drop=True)
+
+    if len(snap_df) == 0:
+        first_time += pd.Timedelta(seconds=10)
+        continue
+
+    ls_ask = snap_df.iloc[0]['askPrice10']
+    ls_bid = snap_df.iloc[0]['bidPrice10']
+
+    n = len(snap_df)
+
+    # ── Melt all 10 ask levels into long format ───────────────────────────────
+    # Result: columns = ['row_idx', 'price', 'notional']
+    ask_price_arr    = snap_df[ask_price_cols].values          # (n, 10)
+    ask_notional_arr = snap_df[ask_size_cols].values * ask_price_arr
+
+    bid_price_arr    = snap_df[bid_price_cols].values
+    bid_notional_arr = snap_df[bid_size_cols].values * bid_price_arr
+
+    row_idx = np.repeat(np.arange(n), 10)   # [0,0,...,1,1,...,n-1,n-1]
+
+    # ── Ask side ──────────────────────────────────────────────────────────────
+    ask_prices_flat    = ask_price_arr.ravel()
+    ask_notional_flat  = ask_notional_arr.ravel()
+
+    ask_mask           = ask_prices_flat <= ls_ask
+    ask_df_long = pd.DataFrame({
+        'row':      row_idx[ask_mask],
+        'price':    ask_prices_flat[ask_mask],
+        'notional': ask_notional_flat[ask_mask],
+    })
+
+    # Pivot: rows=row_idx, cols=price_level → same structure as dict_df_ask
+    # For duplicate (row, price) keep last (same as your append behavior)
+    ask_pivot = (
+        ask_df_long
+        .pivot_table(index='row', columns='price', values='notional', aggfunc='last')
+        .reindex(np.arange(n))   # ensure all rows present
+        .ffill()                 # forward-fill missing rows (your padding logic)
+        .fillna(0)               # backfill zeros at the start
+    )
+
+    # ── Bid side ──────────────────────────────────────────────────────────────
+    bid_prices_flat   = bid_price_arr.ravel()
+    bid_notional_flat = bid_notional_arr.ravel()
+
+    bid_mask          = bid_prices_flat >= ls_bid
+    bid_df_long = pd.DataFrame({
+        'row':      row_idx[bid_mask],
+        'price':    bid_prices_flat[bid_mask],
+        'notional': bid_notional_flat[bid_mask],
+    })
+
+    bid_pivot = (
+        bid_df_long
+        .pivot_table(index='row', columns='price', values='notional', aggfunc='last')
+        .reindex(np.arange(n))
+        .ffill()
+        .fillna(0)
+    )
+
+    # ── Total quantity per row (equivalent to your sum(axis=1)) ───────────────
+    ask_quantity = ask_pivot.sum(axis=1).values   # (n,)
+    bid_quantity = bid_pivot.sum(axis=1).values
+
+    # ── Timestamp in ms ───────────────────────────────────────────────────────
+    times     = snap_df['time']
+    timestamp = (times.diff().cumsum() / pd.Timedelta(milliseconds=1)).fillna(0).values
+
+    # ── Features ──────────────────────────────────────────────────────────────
+    slope_bid = np.polyfit(timestamp, bid_quantity, 1)[0]
+    slope_ask = np.polyfit(timestamp, ask_quantity, 1)[0]
+
+    denom_ask = ask_quantity[-1] + ask_quantity[0]
+    denom_bid = bid_quantity[-1] + bid_quantity[0]
+    std_ask   = ask_quantity.std()
+    std_bid   = bid_quantity.std()
+
+    change_ask   = (ask_quantity[-1] - ask_quantity[0]) / denom_ask if denom_ask != 0 else 0
+    change_bid   = (bid_quantity[-1] - bid_quantity[0]) / denom_bid if denom_bid != 0 else 0
+    variance_ask = ask_quantity.mean() / std_ask if std_ask != 0 else 0
+    variance_bid = bid_quantity.mean() / std_bid if std_bid != 0 else 0
+
+    snap_time = times.iloc[-1].floor('s')
+
+    dict_res['time'].append(snap_time)
+    dict_res['slope_bid'].append(slope_bid)
+    dict_res['slope_ask'].append(slope_ask)
+    dict_res['change_ask'].append(change_ask)
+    dict_res['change_bid'].append(change_bid)
+    dict_res['variance_ask'].append(variance_ask)
+    dict_res['variance_bid'].append(variance_bid)
+
+    first_time += pd.Timedelta(seconds=10)
+
+result_df = pd.DataFrame(dict_res)
