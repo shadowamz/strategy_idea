@@ -1,0 +1,152 @@
+import numpy as np
+import pandas as pd
+
+dict_res = {
+    "time": [],
+    # Original features
+    "slope_bid": [], "slope_ask": [],
+    "change_ask": [], "change_bid": [],
+    "variance_ask": [], "variance_bid": [],
+    # Imbalance features
+    "slope_imbalance": [], "mean_imbalance": [],
+    # Breadth features
+    "n_bid_levels": [], "n_ask_levels": [], "breadth_ratio": [],
+    # Weighted mid features
+    "slope_mid": [], "drift_mid": [],
+    # Absorption features
+    "bid_absorption": [], "ask_absorption": [],
+    "rel_bid_absorption": [], "rel_ask_absorption": [],
+    # Acceleration features
+    "bid_accel": [], "ask_accel": [], "imbalance_accel": [],
+    # Concentration features
+    "bid_concentration": [], "ask_concentration": [],
+}
+
+# ── Pre-round all price columns once ─────────────────────────────────────────
+ask_price_cols = [f'askPrice{k}' for k in range(1, 11)]
+ask_size_cols  = [f'askSize{k}'  for k in range(1, 11)]
+bid_price_cols = [f'bidPrice{k}' for k in range(1, 11)]
+bid_size_cols  = [f'bidSize{k}'  for k in range(1, 11)]
+
+df[ask_price_cols] = df[ask_price_cols].round(2)
+df[bid_price_cols] = df[bid_price_cols].round(2)
+
+first_time = df.iloc[0]['time']
+end_time   = df.iloc[-1]['time']
+
+while end_time > first_time:
+    window_end = first_time + pd.Timedelta(minutes=10)
+
+    snap_df = df[
+        (df['time'] >= first_time) &
+        (df['time'] <= window_end)
+    ].reset_index(drop=True)
+
+    if len(snap_df) == 0:
+        first_time += pd.Timedelta(seconds=10)
+        continue
+
+    ls_ask = snap_df.iloc[0]['askPrice10']
+    ls_bid = snap_df.iloc[0]['bidPrice10']
+
+    n = len(snap_df)
+
+    dict_df_ask = {'time': [], 'bucket': []}
+    dict_df_bid = {'time': [], 'bucket': []}
+
+    # ── Core loop: build price-keyed notional dicts ───────────────────────────
+    for i in range(n):
+        dict_df_ask['time'].append(snap_df.iloc[i]['time'])
+        dict_df_ask['bucket'].append(0)
+        dict_df_bid['time'].append(snap_df.iloc[i]['time'])
+        dict_df_bid['bucket'].append(0)
+
+        for k in range(1, 11):
+            # ── Ask side ─────────────────────────────────────────────────────
+            ask_price    = snap_df.iloc[i][f'askPrice{k}']
+            ask_notional = snap_df.iloc[i][f'askSize{k}'] * ask_price
+            if ask_price <= ls_ask:
+                if ask_price in dict_df_ask:
+                    dict_df_ask[ask_price].append(ask_notional)
+                else:
+                    dict_df_ask[ask_price] = [0] * i + [ask_notional]
+
+            # ── Bid side ─────────────────────────────────────────────────────
+            bid_price    = snap_df.iloc[i][f'bidPrice{k}']
+            bid_notional = snap_df.iloc[i][f'bidSize{k}'] * bid_price
+            if bid_price >= ls_bid:
+                if bid_price in dict_df_bid:
+                    dict_df_bid[bid_price].append(bid_notional)
+                else:
+                    dict_df_bid[bid_price] = [0] * i + [bid_notional]
+
+    # ── Pad short lists (forward-fill with last value) ────────────────────────
+    for key in dict_df_bid:
+        while len(dict_df_bid[key]) < n:
+            dict_df_bid[key].append(dict_df_bid[key][-1])
+    for key in dict_df_ask:
+        while len(dict_df_ask[key]) < n:
+            dict_df_ask[key].append(dict_df_ask[key][-1])
+
+    # ── Build DataFrames ──────────────────────────────────────────────────────
+    bid_df = pd.DataFrame(dict_df_bid)
+    ask_df = pd.DataFrame(dict_df_ask)
+
+    bid_levels_df = bid_df.drop(columns=['time', 'bucket'])  # price levels only
+    ask_levels_df = ask_df.drop(columns=['time', 'bucket'])
+
+    # ── Aggregate quantity per row ────────────────────────────────────────────
+    res = pd.concat([
+        bid_df[['time', 'bucket']],
+        bid_levels_df.sum(axis=1).rename('bid_quantity'),
+        ask_levels_df.sum(axis=1).rename('ask_quantity'),
+    ], axis=1)
+
+    res['timestamp'] = (
+        res['time'].diff().cumsum() / pd.Timedelta(milliseconds=1)
+    ).fillna(0)
+
+    bid_quantity = res['bid_quantity'].values
+    ask_quantity = res['ask_quantity'].values
+    timestamp    = res['timestamp'].values
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FEATURES
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── 1. Original features ──────────────────────────────────────────────────
+    slope_bid = np.polyfit(timestamp, bid_quantity, 1)[0]
+    slope_ask = np.polyfit(timestamp, ask_quantity, 1)[0]
+
+    denom_ask = ask_quantity[-1] + ask_quantity[0]
+    denom_bid = bid_quantity[-1] + bid_quantity[0]
+    std_ask   = ask_quantity.std()
+    std_bid   = bid_quantity.std()
+
+    change_ask   = (ask_quantity[-1] - ask_quantity[0]) / denom_ask if denom_ask != 0 else 0
+    change_bid   = (bid_quantity[-1] - bid_quantity[0]) / denom_bid if denom_bid != 0 else 0
+    variance_ask = ask_quantity.mean() / std_ask if std_ask != 0 else 0
+    variance_bid = bid_quantity.mean() / std_bid if std_bid != 0 else 0
+
+    # ── 2. Imbalance features ─────────────────────────────────────────────────
+    denom_imb  = bid_quantity + ask_quantity
+    imbalance  = np.where(denom_imb != 0,
+                          (bid_quantity - ask_quantity) / denom_imb, 0)
+
+    slope_imbalance = np.polyfit(timestamp, imbalance, 1)[0]
+    mean_imbalance  = imbalance.mean()
+
+    # ── 3. Price level breadth ────────────────────────────────────────────────
+    n_ask_levels = len(ask_levels_df.columns)
+    n_bid_levels = len(bid_levels_df.columns)
+    breadth_ratio = n_bid_levels / n_ask_levels if n_ask_levels != 0 else 0
+
+    # ── 4. Weighted mid price & drift ─────────────────────────────────────────
+    ask_level_prices = np.array(ask_levels_df.columns, dtype=float)
+    bid_level_prices = np.array(bid_levels_df.columns, dtype=float)
+
+    ask_row_sum  = ask_levels_df.sum(axis=1).replace(0, np.nan)
+    bid_row_sum  = bid_levels_df.sum(axis=1).replace(0, np.nan)
+
+    weighted_ask = ask_levels_df.values.dot(ask_level_prices) / ask_row_sum.values
+    weighted_bid = bid_levels_df.values.dot(bid_l
