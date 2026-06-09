@@ -1,0 +1,19 @@
+1. You have a stack of coins in rows, and water drops. Each water drop can stack on top of coins until it overflows.
+So for instance if you have the coins, you can fill up to 2 water drops. Write a program to figure out the total
+number of drops you can fill in.
+2. Find the longest increasing subsequence in a given array. (First assume that the subsequence should be
+continuous and then the general case)
+3. Code a function that takes as input a number (float) and precision (int). The function computes the square root of
+number up to precision.
+a. for example: sqrt(3, 0) = 1, sqrt(3, 1) = 1.7, sqrt(3, 2)= 1.73
+4. Code Fibonacci. What is time complexity?
+5. In a list of integers, find the biggest sub list with increasing numbers. The order shall stay the same but you can
+skip some numbers.
+a. Example: [1,2,2,3] shall return [1,2,3]; [1,2,6,3,2,4] shall return [1,2,3,4]
+6. Find max size of sub-squares in a matrix (dynamic programming)
+7. Given an array Arr[ ], you can switch the values of two adjacent elements and each element can be switched at
+most once. How do you maximise the sum over the indices i of Arr[i]*(i+1)?
+8. Given an array with positive and negative transaction values, find a sub-array to make the value positive.
+9. Contiguous subarray of maximum sum within an array (give indices of the array and the maximum sum).
+a. Given an array, how to design a program finding a subarray whose sum equals to 0.
+10. Hypothesis: test a feature that matches up with data 47% of the time, is that significant, how would you test it?
