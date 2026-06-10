@@ -45,3 +45,43 @@ that can be trapped after raining.
 After k such actions. How many unique numbers are present in A?
 20. Write a function max_average(a) that takes an array of integers 'a' as an input and output the largest average of
 any subarray of 'a'
+
+
+1. In a game, you and two others each think of a positive integer. You win if you pick the smallest number that
+nobody else guesses. (If all three guess the same number, nobody wins). What is the optimal strategy?
+2. We play a game. You are given a 6-sided fair dice. Say the outcome is X. You may choose to receive X dollars, or
+re-roll once. If you re-roll, you must take the outcome of the re-roll (no going back to the first roll). What is your
+strategy and expected value of this game?
+3. Suppose you draw integer N uniformly between 1-1000. Then draw 10 integers uniformly from 1-N. Suppose you
+are shown the 10 numbers, and the game is you win $1 if you guess N right and lose $1 if you guess N wrong.
+What would be your strategy?
+4. Suppose there are a countably infinite number of boxes, labelled with integers from infinity-to-infinity. Suppose
+there is a rabbit starting at position p, and at every time step it will move m boxes. The m and p is fixed but
+unknown. At each time step, you could inspect 1 box to see if the rabbit is inside or not. What is your strategy to
+find this rabbit?
+5. You get to play three games against your father/brother: either FBF (father brother father) or BFB. You have 5%
+chance to win against the brother and 50% win chance against the brother. Which of the two settings (FBF/BFB)
+would you choose to maximize your chance to win 2 consecutive games?
+6. How would you find the value of a game where you can reroll a dice up to 3 times?
+a. Would you pay more or less, to play a game with the maximum of 3 dice?
+b. Would you bet 100x the amount to play once, or bet 1x the amount to play 100 times?
+
+7. Play a game where you play against me. It costs £1 to play and you win £1 if it lands heads. What is the
+probability of me bankrupting you if you start with £2 and I start with £1.
+8. Open-ended discussion on probability distribution: Triple or nothing game, start with initial capital.
+▪ You can make bets with a fraction of your capital – if you win, you have a 50% chance of tripling your bet,
+50% chance of it going to 0.
+▪ What is your expected returns after n games?
+▪ How would you optimise your returns?
+▪ How should you play the game if you are risk averse? How would this differ if you were risk friendly?
+▪ How would the probabilities differ?
+9. In a game, you are given a 100-sided fair dice. You may pay 1 dollar to roll the dice. Say the outcome is X. You
+may choose to 1) receive X dollars, and immediately stop the game; or 2) give up the outcome and re-roll. What is
+your strategy to maximise expected value? (Computations are complex; you do not have to find the final
+numerical value).
+10. Describe an estimator for the shift in a Cauchy distribution. How fast does it converge?
+11. You have $10 and must reach $100. You play a fair 50/50 (win/lose) game such that each bet has a chance of
+doubling if you win, or losing all if you lose.
+a. What option do you take?: you can only make bets in quantity of $10, you only make bets in quantity of
+$1, or you only make bets in quantity of $0.01?
+b. Now the odds are 40/60 (win/lose). Do you change your strategy?
