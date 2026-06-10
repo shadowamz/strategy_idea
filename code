@@ -17,3 +17,31 @@ most once. How do you maximise the sum over the indices i of Arr[i]*(i+1)?
 9. Contiguous subarray of maximum sum within an array (give indices of the array and the maximum sum).
 a. Given an array, how to design a program finding a subarray whose sum equals to 0.
 10. Hypothesis: test a feature that matches up with data 47% of the time, is that significant, how would you test it?
+
+11. Given two variables with similar mean squared errors, how would you test if they are accurate?
+12. Have a string of parameters with open brackets. You are required to ensure all brackets are closed by inserting
+additional brackets. Have to calculate the number of brackets to close all parentheses.
+13. Dynamic programming question. Given a list of integers and definition of a parameter, k. k is the amount of times
+you apply an operation to 1 element. Have to apply a sequence of operations and calculate the minimum sum to
+apply a sequence of k.
+14. Produce a function which two inputs: an integer k and a list of random integers of length n. the output should be
+the number of distinct pairs such that one number in the pair + k equals the other.
+a. You can use the same number twice (for instance use 1 to create the pair (1,1))
+b. Example: the list [1,2] has three distinct pairs: (1,1), (1,2) and (2,2). (The same goes for [1,1,1,2]). If k = 1,
+then only (1,2) satisfies the condition, so the output should be 1.
+
+15. Given an array, code an algorithm to find a (contiguous) sub-array which has the maximum sum
+a. What is overfitting?
+b. What is Monte Carlo?
+c. Discussion about statistical learning methods, their benefits, cons etc.
+d. Questions about black Scholes and option pricing.
+e. Questions about call/put options and hedged portfolio.
+f. Discussion about bootstrapping and swap curve building
+16. Given an array non-negative integers representing an elevation map, find the maximum amount of units of water
+that can be trapped after raining.
+17. Partition a list in 2 sublists, the first should be shorter and of greater sum than the second?
+18. You have n stairs. You can take either 1, 2 or 3 steps. How many ways are there to climb the stairs?
+19. You have two arrays A, B of length n. An action is to take two indices 0 < i, j < n, swap the values in A[i] and B[j].
+After k such actions. How many unique numbers are present in A?
+20. Write a function max_average(a) that takes an array of integers 'a' as an input and output the largest average of
+any subarray of 'a'
