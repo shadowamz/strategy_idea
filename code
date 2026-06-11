@@ -1,87 +1,37 @@
-1. You have a stack of coins in rows, and water drops. Each water drop can stack on top of coins until it overflows.
-So for instance if you have the coins, you can fill up to 2 water drops. Write a program to figure out the total
-number of drops you can fill in.
-2. Find the longest increasing subsequence in a given array. (First assume that the subsequence should be
-continuous and then the general case)
-3. Code a function that takes as input a number (float) and precision (int). The function computes the square root of
-number up to precision.
-a. for example: sqrt(3, 0) = 1, sqrt(3, 1) = 1.7, sqrt(3, 2)= 1.73
-4. Code Fibonacci. What is time complexity?
-5. In a list of integers, find the biggest sub list with increasing numbers. The order shall stay the same but you can
-skip some numbers.
-a. Example: [1,2,2,3] shall return [1,2,3]; [1,2,6,3,2,4] shall return [1,2,3,4]
-6. Find max size of sub-squares in a matrix (dynamic programming)
-7. Given an array Arr[ ], you can switch the values of two adjacent elements and each element can be switched at
-most once. How do you maximise the sum over the indices i of Arr[i]*(i+1)?
-8. Given an array with positive and negative transaction values, find a sub-array to make the value positive.
-9. Contiguous subarray of maximum sum within an array (give indices of the array and the maximum sum).
-a. Given an array, how to design a program finding a subarray whose sum equals to 0.
-10. Hypothesis: test a feature that matches up with data 47% of the time, is that significant, how would you test it?
+21. A subarray is any array consisting of consecutive elements of 'a'. E.g. if a = [a1, a2, a3, a4], then [a2, a3, a4] is a
+subarray of length 3 but [a1, a3, a4] is not a subarray.
+22. Find the largest sum from a contiguous subarray. Solution: Set variables called 'max_sum' and 'current_sum'.
+Iterate once through the array. Set max_sum to current_sum if current_sum >= max_sum. Reset current_sum to
+0 if current_sum becomes negative.
+23. Find the number of occurrences a 3-letter string can be found in a larger one (e.g., SHL in SSQHUL is found
+twice).
+24. Given an array of integers, find the subarray with the largest sum and return its sum – maximum subarray
+question.
+25. Given a list and an integer, check if the integer can be written as the sum of elements in the list.
+26. Given an m x n binary matrix filled with 0’s and 1’s, find the largest square containing only 1’s and return its area –
+maximal square question.
 
-11. Given two variables with similar mean squared errors, how would you test if they are accurate?
-12. Have a string of parameters with open brackets. You are required to ensure all brackets are closed by inserting
-additional brackets. Have to calculate the number of brackets to close all parentheses.
-13. Dynamic programming question. Given a list of integers and definition of a parameter, k. k is the amount of times
-you apply an operation to 1 element. Have to apply a sequence of operations and calculate the minimum sum to
-apply a sequence of k.
-14. Produce a function which two inputs: an integer k and a list of random integers of length n. the output should be
-the number of distinct pairs such that one number in the pair + k equals the other.
-a. You can use the same number twice (for instance use 1 to create the pair (1,1))
-b. Example: the list [1,2] has three distinct pairs: (1,1), (1,2) and (2,2). (The same goes for [1,1,1,2]). If k = 1,
-then only (1,2) satisfies the condition, so the output should be 1.
+27. There are two strings such as a=abc#abc#’ and b=’ababb#’and the ‘#’ denotes a backspace in the keyboard
+(delete the former character). Check if the true a and b is the same.
+28. Given a list such as. [3, 2, 1, 4, 6, 5], get the maximum n such that after split the list into n parts and sort each
+part, the final list would be a non-descending list. The answer is 2 since you can divide it to [3, 2, 1] and [4, 6, 5],
+then sort them and get [1, 2, 3] and [4, 5, 6], combine them and you get a non-descending list.
+29. Given a list of movie durations, you have to find out the minimum day of watching them. You can combine
+movies, but each day you cannot watch more than 3 hours.
+30. A file uploading background. Given what positions are occupied, you have to figure out how to fill the rest of
+positions by 2^n size of files.
+31. Whether you know about the merge sort and quick sort. What is the corresponding time complexity?
+32. What is object oriented programming? Give an example of a project you’ve used OOP in before.
+33. Give the longest subarray which sums to zero.
+34. Given a sphere in 3-D with points (x,y,z) randomly distributed on its surface, what is the expectation E[x] and
+variance Var[x] of coordinate x ?
+a. Solution: by symmetry of distribution, E[x] = coordinate x of the center of the sphere. For the variance,
+one might notice that the variables x,y,z are equally distributed, therefore one can compute E[x^2] using
+the equation of a sphere ( E[r^2] = E[x^2]+E[y^2]+E[z^2] = 3E[x^2]) and use Var[x] = E[x^2]-E[x]^2 to
+compute the variance.
 
-15. Given an array, code an algorithm to find a (contiguous) sub-array which has the maximum sum
-a. What is overfitting?
-b. What is Monte Carlo?
-c. Discussion about statistical learning methods, their benefits, cons etc.
-d. Questions about black Scholes and option pricing.
-e. Questions about call/put options and hedged portfolio.
-f. Discussion about bootstrapping and swap curve building
-16. Given an array non-negative integers representing an elevation map, find the maximum amount of units of water
-that can be trapped after raining.
-17. Partition a list in 2 sublists, the first should be shorter and of greater sum than the second?
-18. You have n stairs. You can take either 1, 2 or 3 steps. How many ways are there to climb the stairs?
-19. You have two arrays A, B of length n. An action is to take two indices 0 < i, j < n, swap the values in A[i] and B[j].
-After k such actions. How many unique numbers are present in A?
-20. Write a function max_average(a) that takes an array of integers 'a' as an input and output the largest average of
-any subarray of 'a'
-
-
-1. In a game, you and two others each think of a positive integer. You win if you pick the smallest number that
-nobody else guesses. (If all three guess the same number, nobody wins). What is the optimal strategy?
-2. We play a game. You are given a 6-sided fair dice. Say the outcome is X. You may choose to receive X dollars, or
-re-roll once. If you re-roll, you must take the outcome of the re-roll (no going back to the first roll). What is your
-strategy and expected value of this game?
-3. Suppose you draw integer N uniformly between 1-1000. Then draw 10 integers uniformly from 1-N. Suppose you
-are shown the 10 numbers, and the game is you win $1 if you guess N right and lose $1 if you guess N wrong.
-What would be your strategy?
-4. Suppose there are a countably infinite number of boxes, labelled with integers from infinity-to-infinity. Suppose
-there is a rabbit starting at position p, and at every time step it will move m boxes. The m and p is fixed but
-unknown. At each time step, you could inspect 1 box to see if the rabbit is inside or not. What is your strategy to
-find this rabbit?
-5. You get to play three games against your father/brother: either FBF (father brother father) or BFB. You have 5%
-chance to win against the brother and 50% win chance against the brother. Which of the two settings (FBF/BFB)
-would you choose to maximize your chance to win 2 consecutive games?
-6. How would you find the value of a game where you can reroll a dice up to 3 times?
-a. Would you pay more or less, to play a game with the maximum of 3 dice?
-b. Would you bet 100x the amount to play once, or bet 1x the amount to play 100 times?
-
-7. Play a game where you play against me. It costs £1 to play and you win £1 if it lands heads. What is the
-probability of me bankrupting you if you start with £2 and I start with £1.
-8. Open-ended discussion on probability distribution: Triple or nothing game, start with initial capital.
-▪ You can make bets with a fraction of your capital – if you win, you have a 50% chance of tripling your bet,
-50% chance of it going to 0.
-▪ What is your expected returns after n games?
-▪ How would you optimise your returns?
-▪ How should you play the game if you are risk averse? How would this differ if you were risk friendly?
-▪ How would the probabilities differ?
-9. In a game, you are given a 100-sided fair dice. You may pay 1 dollar to roll the dice. Say the outcome is X. You
-may choose to 1) receive X dollars, and immediately stop the game; or 2) give up the outcome and re-roll. What is
-your strategy to maximise expected value? (Computations are complex; you do not have to find the final
-numerical value).
-10. Describe an estimator for the shift in a Cauchy distribution. How fast does it converge?
-11. You have $10 and must reach $100. You play a fair 50/50 (win/lose) game such that each bet has a chance of
-doubling if you win, or losing all if you lose.
-a. What option do you take?: you can only make bets in quantity of $10, you only make bets in quantity of
-$1, or you only make bets in quantity of $0.01?
-b. Now the odds are 40/60 (win/lose). Do you change your strategy?
+35. You are given an array "arr" of int that you have to traverse by consecutive jumps. Given that you're at index i,
+you can jump to any other index within [i+1, i+arr[i]]. Write an algorithm to find the minimum number of jump
+require to traverse the array.
+a. Solution: use dynamic programming approach by initializing an array dp and fill it using the recurrence
+relation : dp[i] = min(dp[i],dp[i+j]+1) with j within 1,...,arr[i].
