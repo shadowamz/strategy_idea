@@ -79,5 +79,14 @@ class Solution(object):
                 if row[j] == x^1:
                     row[i+1], row[j] = row[j], row[i+1]
                     break
+
+You are given a 0-indexed string array words having length n and containing 0-indexed strings.
+
+You are allowed to perform the following operation any number of times (including zero):
+
+Choose integers i, j, x, and y such that 0 <= i, j < n, 0 <= x < words[i].length, 0 <= y < words[j].length, and swap the characters words[i][x] and words[j][y].
+Return an integer denoting the maximum number of palindromes words can contain, after performing some operations.
+
+Note: i and j may be equal during an operation.
         return ansa. Solution: use dynamic programming approach by initializing an array dp and fill it using the recurrence
 relation : dp[i] = min(dp[i],dp[i+j]+1) with j within 1,...,arr[i].
