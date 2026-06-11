@@ -33,5 +33,51 @@ compute the variance.
 35. You are given an array "arr" of int that you have to traverse by consecutive jumps. Given that you're at index i,
 you can jump to any other index within [i+1, i+arr[i]]. Write an algorithm to find the minimum number of jump
 require to traverse the array.
-a. Solution: use dynamic programming approach by initializing an array dp and fill it using the recurrence
+
+
+class Solution(object):
+    def minSwapsCouples(self, row):
+        N = len(row) / 2
+        pairs = [[row[i]/2, row[i+1]/2]
+                 for i in xrange(0, 2*N, 2)
+                 if row[i]/2 != row[i+1]/2]
+
+        def swap(a, b, c, d):
+            pairs[a][b], pairs[c][d] = pairs[c][d], pairs[a][b]
+
+        def solve(i = 0):
+            if i == len(pairs): return 0
+            x, y = pairs[i]
+            if x == y: return solve(i+1)
+
+            for j in xrange(i+1, len(pairs)):
+                for k in xrange(2):
+                    if pairs[j][k] == x: jx = j, k
+                    if pairs[j][k] == y: jy = j, k
+
+            swap(i, 1, *jx)
+            ans1 = 1 + solve(i+1)
+            swap(i, 1, *jx)
+
+            swap(i, 0, *jy)
+            ans2 = 1 + solve(i+1)
+            swap(i, 0, *jy)
+
+            return min(ans1, ans2)
+
+        return solve()
+
+
+class Solution(object):
+    def minSwapsCouples(self, row):
+        ans = 0
+        for i in xrange(0, len(row), 2):
+            x = row[i]
+            if row[i+1] == x^1: continue
+            ans += 1
+            for j in xrange(i+1, len(row)):
+                if row[j] == x^1:
+                    row[i+1], row[j] = row[j], row[i+1]
+                    break
+        return ansa. Solution: use dynamic programming approach by initializing an array dp and fill it using the recurrence
 relation : dp[i] = min(dp[i],dp[i+j]+1) with j within 1,...,arr[i].
