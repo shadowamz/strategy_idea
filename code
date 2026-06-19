@@ -1,110 +1,26 @@
-You are given an array "arr" of int that you have to traverse by consecutive jumps. Given that you're at index i,
-you can jump to any other index within [i+1, i+arr[i]]. Write an algorithm to find the minimum number of jump
-require to traverse the array.
-a. Solution: use dynamic programming approach by initializing an array dp and fill it using the recurrence
-relation : dp[i] = min(dp[i],dp[i+j]+1) with j within 1,...,arr[i].
+class Solution:
+    def maxSubarraySumCircular(self, nums: List[int]) -> int:
+        n = len(nums)
+        rightMax = [0] * n
+        rightMax[n - 1] = nums[n - 1]
+        suffixSum = nums[n - 1]
 
-36. You have an n*1 array of 0 and 1 where 0 represents flower type A and 1 represents flower type B. You are a
-florist and can make 2 types of bouquets: AAA ( which costs p) or AB ( which costs q). You can only form
-bouquets using adjacent numbers in the array but don’t have to use all the flowers available. Write an algorithm
-that computes the maximum total value for all the flower bouquets that can be formed.
-37. 17 people (8 males 9 females) sit next to each other. Compute expected number of distinct-gender adjacent pairs.
-38. What is Sharpe ratio, what happens to the Sharpe ratio if you omit some days when return was 0 when you
-compute the Sharpe ratio. If you have n days with nonzero returns and n days with 0 returns, what are the bounds
-on the ratio of the correctly and incorrectly computed Sharpe ratios.
-39. Given an integer n, generate the first n non-primary numbers.
-40. Give the medians of a sliding window (sliding sublist) of a list.
-41. Given an integer array of unique elements, return all possible subsets (the power set). The solution set must not
-contain duplicate subsets. Return the solution in any order.
-42. Given an integer array, find the subarray with the largest sum, and return its sum.
-43. Given two strings a and b, return a Boolean indicating whether they are the same in a case-insensitive way. (For
-example, 'a' and 'A', true, 'ca' and 'cA', true, 'b' and 'c', false).
-a. Based on the previous question, can you also return true when a and b is the same after you add\delete
-one entry in the string? (For example, 'abc' and 'AbcX', true)
+        for i in range(n - 2, -1, -1):
+            suffixSum += nums[i]
+            rightMax[i] = max(rightMax[i + 1], suffixSum)
 
-44. Estimate pi using Monte Carlo samples.
-45. You have 8 men and 9 women in a random permutation. How many opposite sex pairs are there in expectation
-(can be overlapping)?
-46. You are given an array of size n containing integers (positive or negative). You start outside of the array and are
-able to take steps of length either 1 or a prime number ending in 3. At each step you take, the number on which
-you are in the array gets added to your score. You must reach the last cell of the array. Design an algorithm that
-gives the path giving the maximum score achievable.
-▪ Example: for the array [20, 10, -30, 40], the most optimal path is to take a step of size one and then size three
-such that you reach cells 20 and 40 giving a score of 60.
-47. Given an array of integers and an integer k, return the length of the smallest subarray that contains k unique
-values. If no such subarray exists, return -1. What's the time complexity of this algorithm?
-48. A gate is modelled as a n*m grid, unit length of which is 1. A prisoner wants to remove some lines to make a hole.
-The vertical lines removed are stored in v[], and horizontal lines are stored in h[]. What is the area of the largest
-hole?
-49. Given an array, compare every element with the elements before it. Find the largest positive difference and return
-it. If the array is not ascending at any place, return -1.
-50. Count arithmetic subarray.
-a. Problem: Given an integer array `nums` return the number of arithmetic subarrays of `nums`.
-51. Given a list of numbers e.g [1,1,3,2,4,2,7,8] and a number k eg 2, how many pairs of values are there in the list
-(a,b) st a+k=b. For 2 pairs (a,b) and (c,d) they are different if at least one of c or d is not a or b.
-52. Given a number and a precision, write a function that gives the square root of the number to the desired precision
-(ie number of decimal points) what is the time complexity?
+        maxSum = nums[0]
+        specialSum = nums[0]
+        curMax = 0
+        prefixSum = 0
 
-53. Task: Given a 2-D matrix from 1 to 0, you have to identify ‘islands’ you have to find links in arrays based on co-
-efficients.
+        for i in range(n):
+            # Kadane's algorithm
+            curMax = max(curMax, 0) + nums[i]
+            maxSum = max(maxSum, curMax)
 
-54. Given n integers to form an array, and a desired value k, such that the sum of subarray is equal to k. Need to
-return the number of possible subarrays which sum is equal to k. Note that subarray is contiguous.
-55. Given an array, say the value that appears most often dominates the array. What is the length of the smallest sub
-array that has the same value dominating and appearing with the same frequency?
-56. Given an array, what is the length of the longest strictly increasing sub array?
-57. You have a garden of roses (0) and cosmos (1). They are harvested in specific order (example 010110).
-You can make 2 types of bouquets:
-▪ Type 1: 1 rose (0) and 1 cosmos (0) which can be sold at price p
-▪ Type 2: 3 roses, which sells at price q.
-To make a bouquet, you can only use adjacent flowers (ie i, i+1, i+2).
-Given a serie of flowers (ex 010110), what combination of bouquets should you do to maximise profits?
-58. Code up Monte Carlo for approximating PI.
-59. Given an array, split number arr[i] to x+y. Minimum number of split needed so that the array has an increasing
-order.
+            prefixSum += nums[i]
+            if i + 1 < n:
+                specialSum = max(specialSum, prefixSum + rightMax[i + 1])
 
- there are n items to sell. Each item has a price. However, there are some special offers, and a special offer consists of one or more different kinds of items with a sale price.
-
-You are given an integer array price where price[i] is the price of the ith item, and an integer array needs where needs[i] is the number of pieces of the ith item you want to buy.
-
-You are also given an array special where special[i] is of size n + 1 where special[i][j] is the number of pieces of the jth item in the ith offer and special[i][n] (i.e., the last integer in the array) is the price of the ith offer.
-
-Return the lowest price you have to pay for exactly certain items as given, where you could make optimal use of the special offers. You are not allowed to buy more items than you want, even if that would lower the overall price. You could use any of the special offers as many times as you want.
-
- 
-
-Example 1:
-
-Input: price = [2,5], special = [[3,0,5],[1,2,10]], needs = [3,2]
-Output: 14
-Explanation: There are two kinds of items, A and B. Their prices are $2 and $5 respectively. 
-In special offer 1, you can pay $5 for 3A and 0B
-In special offer 2, you can pay $10 for 1A and 2B. 
-You need to buy 3A and 2B, so you may pay $10 for 1A and 2B (special offer #2), and $4 for 2A.
-Example 2:
-
-Input: price = [2,3,4], special = [[1,1,0,4],[2,2,1,9]], needs = [1,2,1]
-Output: 11
-Explanation: The price of A is $2, and $3 for B, $4 for C. 
-You may pay $4 for 1A and 1B, and $9 for 2A ,2B and 1C. 
-You need to buy 1A ,2B and 1C, so you may pay $4 for 1A and 1B (special offer #1), and $3 for 1B, $4 for 1C. 
-You cannot add more items, though only $9 for 2A ,2B and 1C.
-60. You have a matrix of 0s and 1s and two possible operations: pick a row and circularly shift it left, or right. Find the
-minimal amount of these operations needed to obtain a column full of 1s (return -1 if not possible).
-class Solution(object):
-    def rotatedDigits(self, N):
-        A = map(int, str(N))
-
-        memo = {}
-        def dp(i, equality_flag, involution_flag):
-            if i == len(A): return +(involution_flag)
-            if (i, equality_flag, involution_flag) not in memo:
-                ans = 0
-                for d in xrange(A[i] + 1 if equality_flag else 10):
-                    if d in {3, 4, 7}: continue
-                    ans += dp(i+1, equality_flag and d == A[i],
-                              involution_flag or d in {2, 5, 6, 9})
-                memo[i, equality_flag, involution_flag] = ans
-            return memo[i, equality_flag, involution_flag]
-
-        return dp(0, True, False)
+        return max(maxSum, specialSum)
