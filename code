@@ -67,3 +67,44 @@ products in any order and earn a profit of its price multiplied by the number of
 including that point. Calculate the maximum possible profit.
 75. Write a function f(a,b) with a strictly positive integer, b list of strictly positive integer. Return whether a can be
 written as a sum of the elements of b (each element can be repeated as many times as possible).
+
+
+class Solution:
+    def assignBikes(self, workers: List[List[int]], bikes: List[List[int]]) -> int:
+        num_workers = len(workers)
+        num_bikes = len(bikes)
+        
+        INF = float('inf')
+        memo = [INF] * 1024
+        memo[0] = 0  # no bikes assigned yet → distance sum is 0
+        
+        def count_num_of_ones(mask: int) -> int:
+            count = 0
+            while mask != 0:
+                mask &= (mask - 1)  # clears the lowest set bit
+                count += 1
+            return count
+        
+        def find_distance(worker, bike) -> int:
+            return abs(worker[0] - bike[0]) + abs(worker[1] - bike[1])
+        
+        smallest_distance_sum = INF
+        
+        for mask in range(1 << num_bikes):
+            next_worker_index = count_num_of_ones(mask)
+            
+            # all workers assigned → candidate answer
+            if next_worker_index >= num_workers:
+                smallest_distance_sum = min(smallest_distance_sum, memo[mask])
+                continue
+            
+            for bike_index in range(num_bikes):
+                # check if this bike hasn't been used yet
+                if not (mask & (1 << bike_index)):
+                    new_mask = mask | (1 << bike_index)
+                    memo[new_mask] = min(
+                        memo[new_mask],
+                        memo[mask] + find_distance(workers[next_worker_index], bikes[bike_index])
+                    )
+        
+        return smallest_distance_sum
