@@ -24,3 +24,46 @@ class Solution:
                 specialSum = max(specialSum, prefixSum + rightMax[i + 1])
 
         return max(maxSum, specialSum)
+
+61. There are n rooms, m tunnels between pairs of rooms, and some keys. Each room i contains a key of type r[i],
+and the jth tunnel is between u[j] and v[j]. However, the jth tunnel is locked and requires a key of type c[j] to move
+through it. Given a starting room s, which rooms can you visit? Which room should you start in to access the most
+rooms?
+62. There is an array of numbers like [3, -3, 5, -2, -2, -2, -2, 6, -1] and we need to find longest possible subsequence
+such that cumulative sum is not negative anywhere.
+63. Find sqrt(n, p), which is square root of n with precision p.
+64. A frog wants to cross a river by jumping on pebbles. The frog can only skip one pebble at most. Each pebble has
+a weight (the number of seconds that the frog should spend on the pebble before jumping again). Knowing that
+the frog should be on the first and the last pebble of the way, and given the array with the weights, find the optimal
+way to get to the end of the river (the way with the minimum waiting)?
+65. You have a list of intervals indicating some filter and a list of signals (an array with numbers). Write a function that
+returns how many signals comply with all the filters.
+66. Write a function that returns the running median of a list of numbers.
+67. Dynamic programming, bouquet of flowers, roses 0, daisy’s 1. Can make two types of bouquets. 3 roses is 3 0’s
+and 3 daisys 3 0’s. Dollars P and Q from selling bouquets. Figure out size of bouquets and max revenue. Only
+make bouquets from consecutive sub arrays.
+68. Given X,Y independant variables following a normal probability function, what is the probability of X + Y > 0 given
+X > 0.
+69. We have coupons with numbers from long LowValue to long HighValue, each coupon is associated with a code
+which is the sum of the number's digits. We attribute winners uniformly on all codes. What is the minimum number
+of ways to distribute winners and what is the biggest number of winners. (Example if coupons range from 2 to 11,
+all numbers from 3 to 10 have one winner each (code appears uniquely) but 2 and 11 both have code=2, so 2
+winners for code =2). Therefore two ways to get 9 ways to distribute winners and and 2 winners). Answer by
+dynamic programming.
+70. Given a list of closed intervals and a list of numbers, output the number of intervals that each number falls within.
+71. You are given a list of integers. Your task is to return the list sorted first by frequency and then by value (in
+ascending order).
+Example:
+Input: [3, 5, 2, 2, 4]
+Output: [2, 2, 3, 4, 5]
+Explanation: In this example, 2 appears twice, so it comes first. The remaining numbers (`3`, `4`, `5`) appear once
+and are sorted in ascending order.
+72. Given an array, determine the number of operation to make it non decreasing, where an operation consists of
+splitting an entry into 2 integers such that their sum is the original entry. The arr after each operation will increase
+by one.
+73. What can you do in linear regression if the design matrix is not invertible?
+74. You have a list of product prices and a list of corresponding product categories. You can choose to sell the
+products in any order and earn a profit of its price multiplied by the number of categories sold from up to and
+including that point. Calculate the maximum possible profit.
+75. Write a function f(a,b) with a strictly positive integer, b list of strictly positive integer. Return whether a can be
+written as a sum of the elements of b (each element can be repeated as many times as possible).
